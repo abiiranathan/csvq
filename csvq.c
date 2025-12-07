@@ -1065,7 +1065,7 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
 }
 
 int main(int argc, char* argv[]) {
-    FlagParser* parser = flag_parser_new("csv", "Pretty print CSV to stdout");
+    FlagParser* parser = flag_parser_new("csvq", "Query and format CSV files");
     if (parser == NULL) {
         return EXIT_FAILURE;
     }
