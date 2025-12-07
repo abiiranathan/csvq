@@ -1,4 +1,5 @@
 *.csv
 *.tsv
+*.json
 *.excel
 csv

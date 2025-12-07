@@ -26,6 +26,9 @@
 /** Maximum number of columns we support selecting/reordering. */
 #define MAX_SELECTED_COLUMNS 64
 
+/** Maximum number of AND conditions in a where clause. */
+#define MAX_WHERE_CONDITIONS 8
+
 /** ANSI color codes for column coloring. */
 static const char* COLUMN_COLORS[] = {
     "\033[36m",  // Cyan
@@ -88,6 +91,19 @@ typedef struct {
  * Much more efficient than dynamic arrays for up to 64 columns.
  */
 static unsigned long hidden_columns_mask = 0;
+
+/** Multiple where clauses combined with AND. */
+typedef struct {
+    WhereClause conditions[MAX_WHERE_CONDITIONS];
+    size_t count;
+} WhereFilter;
+
+/** Context for the qsort comparison function. */
+static struct {
+    size_t col_idx;  // Index of column to sort by
+    bool desc;       // Sort descending?
+    bool active;     // Is sorting active?
+} sort_ctx = {0, false, false};
 
 /**
  * Marks a column as hidden.
@@ -154,6 +170,43 @@ static int parse_hidden_columns(const char* columns_str) {
 
     free(str_copy);
     return count;
+}
+
+/**
+ * Comparator function for qsort.
+ * Tries to compare numerically first; falls back to string comparison.
+ */
+static int compare_rows(const void* a, const void* b) {
+    const Row* r1 = *(const Row**)a;
+    const Row* r2 = *(const Row**)b;
+
+    // Handle rows with missing columns safely
+    const char* val1 =
+        (sort_ctx.col_idx < r1->count && r1->fields[sort_ctx.col_idx]) ? r1->fields[sort_ctx.col_idx] : "";
+    const char* val2 =
+        (sort_ctx.col_idx < r2->count && r2->fields[sort_ctx.col_idx]) ? r2->fields[sort_ctx.col_idx] : "";
+
+    int result = 0;
+
+    // Try numeric comparison first
+    char *end1, *end2;
+    double d1 = strtod(val1, &end1);
+    double d2 = strtod(val2, &end2);
+
+    // If both values parsed completely as numbers
+    if (*val1 != '\0' && *val2 != '\0' && *end1 == '\0' && *end2 == '\0') {
+        if (d1 < d2)
+            result = -1;
+        else if (d1 > d2)
+            result = 1;
+        else
+            result = 0;
+    } else {
+        // Fallback to case-insensitive string comparison
+        result = strcasecmp(val1, val2);
+    }
+
+    return sort_ctx.desc ? -result : result;
 }
 
 /**
@@ -259,95 +312,141 @@ static bool parse_column_selection(const char* select_str, const Row* header, Co
 }
 
 /**
- * Parses a where clause string (e.g., "age > 25" or "name contains John").
+ * Parses a where clause string with AND support (e.g., "age > 25 AND name contains John").
  * @param where_str The where clause string.
- * @param clause Output WhereClause structure. Caller must free fields.
+ * @param filter Output WhereFilter structure. Caller must free with where_filter_free().
  * @return true on success, false on error.
  */
-static bool parse_where_clause(const char* where_str, WhereClause* clause) {
-    if (where_str == NULL || where_str[0] == '\0' || clause == NULL) {
+static bool parse_where_clause(const char* where_str, WhereFilter* filter) {
+    if (where_str == NULL || where_str[0] == '\0' || filter == NULL) {
         return false;
     }
+
+    filter->count = 0;
 
     char* str_copy = strdup(where_str);
     if (str_copy == NULL) {
         return false;
     }
 
-    // Try to find operator
-    const char* operators[] = {">=", "<=", "!=", "contains", ">", "<", "="};
-    CompareOp ops[]         = {OP_GREATER_EQ, OP_LESS_EQ, OP_NOT_EQUALS, OP_CONTAINS, OP_GREATER, OP_LESS, OP_EQUALS};
-    size_t num_ops          = sizeof(operators) / sizeof(operators[0]);
+    // Split by AND (case-insensitive)
+    char* clause_str = str_copy;
 
-    char* op_pos       = NULL;
-    CompareOp found_op = OP_CONTAINS;
+    while (clause_str != NULL && filter->count < MAX_WHERE_CONDITIONS) {
+        // Find next AND (case-insensitive)
+        char* and_pos = strcasestr(clause_str, " AND ");
+        if (and_pos != NULL) {
+            *and_pos = '\0';
+        }
 
-    for (size_t i = 0; i < num_ops; i++) {
-        char* pos = strstr(str_copy, operators[i]);
-        if (pos != NULL) {
-            op_pos   = pos;
-            found_op = ops[i];
+        // Trim whitespace from clause
+        while (isspace((unsigned char)*clause_str)) {
+            clause_str++;
+        }
+        char* end = clause_str + strlen(clause_str) - 1;
+        while (end > clause_str && isspace((unsigned char)*end)) {
+            *end-- = '\0';
+        }
+
+        if (clause_str[0] == '\0') {
+            if (and_pos != NULL) {
+                clause_str = and_pos + 5;  // Skip " AND "
+                continue;
+            }
+            break;
+        }
+
+        // Parse individual condition
+        const char* operators[] = {">=", "<=", "!=", "contains", ">", "<", "="};
+        CompareOp ops[] = {OP_GREATER_EQ, OP_LESS_EQ, OP_NOT_EQUALS, OP_CONTAINS, OP_GREATER, OP_LESS, OP_EQUALS};
+        size_t num_ops  = sizeof(operators) / sizeof(operators[0]);
+
+        char* op_pos       = NULL;
+        CompareOp found_op = OP_CONTAINS;
+
+        for (size_t i = 0; i < num_ops; i++) {
+            char* pos = strstr(clause_str, operators[i]);
+            if (pos != NULL) {
+                op_pos   = pos;
+                found_op = ops[i];
+                break;
+            }
+        }
+
+        if (op_pos == NULL) {
+            fprintf(stderr, "Error: No valid operator in clause: %s\n", clause_str);
+            free(str_copy);
+            return false;
+        }
+
+        // Split into column name and value
+        *op_pos        = '\0';
+        char* col_name = clause_str;
+        char* value    = op_pos + strlen(operators[found_op == OP_GREATER_EQ   ? 0
+                                                   : found_op == OP_LESS_EQ    ? 1
+                                                   : found_op == OP_NOT_EQUALS ? 2
+                                                   : found_op == OP_CONTAINS   ? 3
+                                                   : found_op == OP_GREATER    ? 4
+                                                   : found_op == OP_LESS       ? 5
+                                                                               : 6]);
+
+        // Trim whitespace from both
+        while (isspace((unsigned char)*col_name))
+            col_name++;
+        end = col_name + strlen(col_name) - 1;
+        while (end > col_name && isspace((unsigned char)*end))
+            *end-- = '\0';
+
+        while (isspace((unsigned char)*value))
+            value++;
+        end = value + strlen(value) - 1;
+        while (end > value && isspace((unsigned char)*end))
+            *end-- = '\0';
+
+        if (col_name[0] == '\0' || value[0] == '\0') {
+            fprintf(stderr, "Error: Invalid where clause format\n");
+            free(str_copy);
+            return false;
+        }
+
+        WhereClause* clause = &filter->conditions[filter->count];
+        clause->column_name = strdup(col_name);
+        clause->value       = strdup(value);
+        clause->op          = found_op;
+        clause->column_idx  = (size_t)-1;
+        clause->is_numeric =
+            (found_op == OP_GREATER || found_op == OP_LESS || found_op == OP_GREATER_EQ || found_op == OP_LESS_EQ);
+
+        if (clause->column_name == NULL || clause->value == NULL) {
+            free(str_copy);
+            return false;
+        }
+
+        filter->count++;
+
+        if (and_pos != NULL) {
+            clause_str = and_pos + 5;  // Skip " AND "
+        } else {
             break;
         }
     }
 
-    if (op_pos == NULL) {
-        fprintf(stderr, "Error: No valid operator found in where clause\n");
-        free(str_copy);
-        return false;
-    }
-
-    // Split into column name and value
-    *op_pos        = '\0';
-    char* col_name = str_copy;
-    char* value    = op_pos + strlen(operators[found_op == OP_GREATER_EQ   ? 0
-                                               : found_op == OP_LESS_EQ    ? 1
-                                               : found_op == OP_NOT_EQUALS ? 2
-                                               : found_op == OP_CONTAINS   ? 3
-                                               : found_op == OP_GREATER    ? 4
-                                               : found_op == OP_LESS       ? 5
-                                                                           : 6]);
-
-    // Trim whitespace from both
-    while (isspace((unsigned char)*col_name))
-        col_name++;
-    char* end = col_name + strlen(col_name) - 1;
-    while (end > col_name && isspace((unsigned char)*end))
-        *end-- = '\0';
-
-    while (isspace((unsigned char)*value))
-        value++;
-    end = value + strlen(value) - 1;
-    while (end > value && isspace((unsigned char)*end))
-        *end-- = '\0';
-
-    if (col_name[0] == '\0' || value[0] == '\0') {
-        fprintf(stderr, "Error: Invalid where clause format\n");
-        free(str_copy);
-        return false;
-    }
-
-    clause->column_name = strdup(col_name);
-    clause->value       = strdup(value);
-    clause->op          = found_op;
-    clause->column_idx  = (size_t)-1;  // Will be resolved later
-    clause->is_numeric =
-        (found_op == OP_GREATER || found_op == OP_LESS || found_op == OP_GREATER_EQ || found_op == OP_LESS_EQ);
-
     free(str_copy);
-    return clause->column_name != NULL && clause->value != NULL;
+    return filter->count > 0;
 }
 
 /**
- * Frees a WhereClause structure.
- * @param clause The clause to free.
+ * Frees a WhereFilter structure.
+ * @param filter The filter to free.
  */
-static void where_clause_free(WhereClause* clause) {
-    if (clause == NULL) {
+static void where_filter_free(WhereFilter* filter) {
+    if (filter == NULL) {
         return;
     }
-    free(clause->column_name);
-    free(clause->value);
+    for (size_t i = 0; i < filter->count; i++) {
+        free(filter->conditions[i].column_name);
+        free(filter->conditions[i].value);
+    }
 }
 
 /**
@@ -410,6 +509,26 @@ static bool evaluate_where_clause(const Row* row, const WhereClause* clause) {
     }
 
     return false;
+}
+
+/**
+ * Evaluates a where filter (all conditions must match - AND logic).
+ * @param row The row to check.
+ * @param filter The where filter.
+ * @return true if the row matches all conditions, false otherwise.
+ */
+static bool evaluate_where_filter(const Row* row, const WhereFilter* filter) {
+    if (row == NULL || filter == NULL || filter->count == 0) {
+        return true;
+    }
+
+    // All conditions must match (AND logic)
+    for (size_t i = 0; i < filter->count; i++) {
+        if (!evaluate_where_clause(row, &filter->conditions[i])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /**
@@ -795,7 +914,7 @@ static void print_markdown_separator(size_t col_count, const ColumnSelection* se
  * @param selection Optional column selection (NULL for all columns).
  */
 static void print_table(Row** rows, size_t row_count, bool has_header, OutputFormat format, bool use_colors,
-                        const char* filter_pattern, WhereClause* where, const ColumnSelection* selection) {
+                        const char* filter_pattern, WhereFilter* where, const ColumnSelection* selection) {
     if (row_count == 0 || rows[0]->count == 0) {
         fprintf(stderr, "Error: No data to print\n");
         return;
@@ -804,14 +923,18 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
     size_t original_col_count = rows[0]->count;
     size_t col_count          = selection != NULL ? selection->count : original_col_count;
 
-    // Resolve where clause column index if present
-    if (where != NULL && where->column_idx == (size_t)-1 && has_header) {
-        ssize_t idx = find_column_by_name(rows[0], where->column_name);
-        if (idx < 0) {
-            fprintf(stderr, "Error: Column '%s' not found in where clause\n", where->column_name);
-            return;
+    // Resolve where clause column indices if present
+    if (where != NULL && has_header) {
+        for (size_t i = 0; i < where->count; i++) {
+            if (where->conditions[i].column_idx == (size_t)-1) {
+                ssize_t idx = find_column_by_name(rows[0], where->conditions[i].column_name);
+                if (idx < 0) {
+                    fprintf(stderr, "Error: Column '%s' not found in where clause\n", where->conditions[i].column_name);
+                    return;
+                }
+                where->conditions[i].column_idx = (size_t)idx;
+            }
         }
-        where->column_idx = (size_t)idx;
     }
 
     size_t* widths = NULL;
@@ -858,7 +981,7 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
     for (size_t i = start_row; i < row_count; i++) {
         bool matches = row_matches_filter(rows[i], filter_pattern);
         if (matches && where != NULL) {
-            matches = evaluate_where_clause(rows[i], where);
+            matches = evaluate_where_filter(rows[i], where);
         }
 
         if (matches) {
@@ -871,7 +994,7 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
                 for (size_t j = i + 1; j < row_count; j++) {
                     bool next_matches = row_matches_filter(rows[j], filter_pattern);
                     if (next_matches && where != NULL) {
-                        next_matches = evaluate_where_clause(rows[j], where);
+                        next_matches = evaluate_where_filter(rows[j], where);
                     }
 
                     if (next_matches) {
@@ -921,24 +1044,30 @@ int main(int argc, char* argv[]) {
     bool skip_header     = false;
     bool use_colors      = false;
     char comment         = '#';
-    char delimiter       = ',';
+    char* delim_arg      = ",";
     char* hide_cols      = NULL;
     char* filter_pattern = NULL;
     char* where_str      = NULL;
     char* select_str     = NULL;
     char* format_str     = NULL;
+    bool sort_desc       = false;
+    char* sort_col       = NULL;
+    size_t max_memory    = 2 << 20;  // 2 MB
 
+    flag_size_t(parser, "memory", 'm', "Maximum memory in bytes to use", &max_memory);
     flag_bool(parser, "header", 'h', "The CSV file has a header", &has_header);
     flag_bool(parser, "skip-header", 's', "Skip the header", &skip_header);
     flag_bool(parser, "color", 'C', "Use colors for each column", &use_colors);
+    flag_bool(parser, "desc", 'D', "Sort in descending order", &sort_desc);
     flag_char(parser, "comment", 'c', "Comment Character", &comment);
-    flag_char(parser, "delimiter", 'd', "The CSV delimiter", &delimiter);
+    flag_string(parser, "delimiter", 'd', "The CSV delimiter (use '\\t' for tab)", &delim_arg);
     flag_string(parser, "hide", 'H', "Comma-separated column indices to hide (e.g., 0,2,5)", &hide_cols);
     flag_string(parser, "filter", 'f', "Show only rows containing this pattern", &filter_pattern);
     flag_string(parser, "where", 'w', "Filter rows with condition (e.g., 'age > 25', 'name contains John')",
                 &where_str);
     flag_string(parser, "select", 'S', "Select and order columns (e.g., 'name,age' or '0,2,1')", &select_str);
     flag_string(parser, "output", 'o', "Output format: table (default), csv, tsv, json, markdown", &format_str);
+    flag_string(parser, "sort", 'B', "Sort by column name or index", &sort_col);
 
     if (flag_parse(parser, argc, argv) != FLAG_OK) {
         flag_parser_free(parser);
@@ -946,12 +1075,25 @@ int main(int argc, char* argv[]) {
     }
 
     if (flag_positional_count(parser) < 1) {
-        fprintf(stderr, "Error: Missing required CSV filename\n");
+        fprintf(stderr, "Required positional argument <filename> is missing\n");
+        flag_print_usage(parser);
         flag_parser_free(parser);
         return EXIT_FAILURE;
     }
 
-    // Fix Bug 1: If skip-header is requested, the first parsed row is actually data.
+    char delimiter = ',';  // Default is comma (csv)
+
+    // Conver char * to char because it painful to pass \t via command-line.
+    if (delim_arg != NULL) {
+        if (strcmp(delim_arg, "\\t") == 0) {
+            delimiter = '\t';
+        } else {
+            // Take the first character (handles literal tabs or custom chars like ';')
+            delimiter = delim_arg[0];
+        }
+    }
+
+    // If skip-header is requested, the first parsed row is actually data.
     // We shouldn't treat it as a header for selection or printing logic.
     if (skip_header) {
         has_header = false;
@@ -983,9 +1125,8 @@ int main(int argc, char* argv[]) {
     }
 
     // Initialize the CSV reader
-    CsvReader* reader = csv_reader_new(filename);
+    CsvReader* reader = csv_reader_new(filename, max_memory);
     if (reader == NULL) {
-        fprintf(stderr, "Error: Failed to open CSV file: %s\n", filename);
         flag_parser_free(parser);
         return EXIT_FAILURE;
     }
@@ -997,11 +1138,13 @@ int main(int argc, char* argv[]) {
         .comment     = comment,
         .delim       = delimiter,
     };
+
     csv_reader_setconfig(reader, config);
 
     Row** rows = csv_reader_parse(reader);
     if (rows == NULL) {
-        fprintf(stderr, "Error: Failed to parse CSV file\n");
+        fprintf(stderr, "Error: Failed to parse CSV file, likely due to invalid delimiter. ");
+        fprintf(stderr, "Use --delimiter='\\\\t' for Tab-seperated Value file\n");
         csv_reader_free(reader);
         flag_parser_free(parser);
         return EXIT_FAILURE;
@@ -1015,6 +1158,39 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
+    // Sort data is column is specified.
+    if (sort_col != NULL && count > 0) {
+        long idx = -1;
+        char* endptr;
+        long parsed_idx = strtol(sort_col, &endptr, 10);
+
+        // Determine Index
+        if (*endptr == '\0' && parsed_idx >= 0) {
+            idx = parsed_idx;
+        } else if (has_header) {
+            // Reusing existing find_column_by_name helper
+            ssize_t found = find_column_by_name(rows[0], sort_col);
+            if (found >= 0) idx = found;
+        }
+
+        if (idx >= 0) {
+            sort_ctx.col_idx = (size_t)idx;
+            sort_ctx.desc    = sort_desc;
+            sort_ctx.active  = true;
+
+            // If we have a header, we must NOT sort row[0].
+            // We shift the array pointer by 1 and decrease count by 1.
+            size_t sort_start_offset = (has_header) ? 1 : 0;
+            size_t sort_count        = (count > sort_start_offset) ? count - sort_start_offset : 0;
+
+            if (sort_count > 1) {
+                qsort(rows + sort_start_offset, sort_count, sizeof(Row*), compare_rows);
+            }
+        } else {
+            fprintf(stderr, "Warning: Could not resolve sort column '%s'. Sorting skipped.\n", sort_col);
+        }
+    }
+
     // Parse column selection if provided
     ColumnSelection selection = {0};
     ColumnSelection* sel_ptr  = NULL;
@@ -1022,25 +1198,21 @@ int main(int argc, char* argv[]) {
         const Row* header = has_header ? rows[0] : NULL;
         if (parse_column_selection(select_str, header, &selection)) {
             sel_ptr = &selection;
-        } else {
-            fprintf(stderr, "Warning: Failed to parse column selection, using all columns\n");
         }
     }
 
     // Parse where clause if provided
-    WhereClause where      = {0};
-    WhereClause* where_ptr = NULL;
+    WhereFilter where      = {0};
+    WhereFilter* where_ptr = NULL;
 
     if (where_str != NULL) {
         if (parse_where_clause(where_str, &where)) {
             where_ptr = &where;
-        } else {
-            fprintf(stderr, "Warning: Failed to parse where clause, ignoring\n");
         }
     }
 
     print_table(rows, count, has_header, format, use_colors, filter_pattern, where_ptr, sel_ptr);
-    where_clause_free(where_ptr);
+    where_filter_free(where_ptr);
     csv_reader_free(reader);
     flag_parser_free(parser);
     return EXIT_SUCCESS;
