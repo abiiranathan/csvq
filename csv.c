@@ -706,6 +706,23 @@ static char* trim_and_escape_json(const char* str) {
 }
 
 /**
+ * Prints a field for ASCII table output, replacing control characters
+ * (tabs, newlines, returns) with spaces to maintain alignment.
+ */
+static void print_sanitized_field(const char* str) {
+    if (str == NULL) return;
+
+    for (const char* p = str; *p; p++) {
+        // Replace Tab, Newline, or Carriage Return with a generic space
+        if (*p == '\t' || *p == '\n' || *p == '\r') {
+            putchar(' ');
+        } else {
+            putchar(*p);
+        }
+    }
+}
+
+/**
  * Prints a single row in the specified output format.
  * @param row The row to print.
  * @param widths Array of column widths (for table format).
@@ -748,11 +765,24 @@ static void print_row_format(const Row* row, const size_t* widths, size_t col_co
                 const char* color = get_column_color(i, use_colors);
                 const char* reset = get_color_reset(use_colors);
 
-                printf("%s %s", color, field);
+                // Print color code
+                fputs(color, stdout);
+
+                // Print content space-by-space.
+                // This ensures a '\t' inside data is printed as ' ' (1 char),
+                // matching the logic of strlen used to calculate width.
+                putchar(' ');
+                print_sanitized_field(field);
+
+                // Print padding
                 for (size_t j = 0; j < padding; j++) {
                     putchar(' ');
                 }
-                printf(" %s|", reset);
+
+                // Print closing space and reset color
+                putchar(' ');
+                fputs(reset, stdout);
+                putchar('|');
             }
             putchar('\n');
             break;
