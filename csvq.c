@@ -172,6 +172,43 @@ static int parse_hidden_columns(const char* columns_str) {
     return count;
 }
 
+#ifdef _WIN32
+#include <ctype.h>
+#include <string.h>
+
+static char* strcasestr(const char* haystack, const char* needle) {
+    if (needle == NULL || *needle == '\0') {
+        return (char*)haystack;
+    }
+
+    const size_t needle_len   = strlen(needle);
+    const size_t haystack_len = strlen(haystack);
+
+    if (needle_len > haystack_len) {
+        return NULL;
+    }
+
+    const size_t search_len = haystack_len - needle_len + 1;
+
+    for (size_t i = 0; i < search_len; i++) {
+        if (tolower((unsigned char)haystack[i]) == tolower((unsigned char)needle[0])) {
+            bool match = true;
+            for (size_t j = 1; j < needle_len; j++) {
+                if (tolower((unsigned char)haystack[i + j]) != tolower((unsigned char)needle[j])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                return (char*)(haystack + i);
+            }
+        }
+    }
+
+    return NULL;
+}
+#endif
+
 /**
  * Comparator function for qsort.
  * Tries to compare numerically first; falls back to string comparison.
