@@ -328,7 +328,7 @@ static void compute_column_widths(Row** rows, size_t row_count, size_t col_count
         for (size_t i = 0; i < num_cols; i++) {
             size_t col = selection != NULL ? selection->indices[i] : i;
 
-            // Fix: If a column is specifically selected, we ignore the 'hide' flag.
+            // If a column is specifically selected, we ignore the 'hide' flag.
             // Only skip calculation if no selection is active and column is hidden.
             if ((selection == NULL && is_column_hidden(col)) || col >= r->count) {
                 continue;
@@ -423,13 +423,13 @@ static char* trim_and_escape_json(const char* s) {
     // Get length of trimmed string.
     size_t len = strlen(str);
 
-    // 3. Allocate memory (Worst case: every char needs escaping \x -> \\x)
+    // Allocate memory (Worst case: every char needs escaping \x -> \\x)
     char* escaped = malloc(len * 2 + 1);
     if (escaped == NULL) {
         return NULL;
     }
 
-    // 4. Escape characters within the trimmed range
+    // Escape characters within the trimmed range
     size_t j = 0;
     for (size_t i = 0; i < len; i++) {
         char c = str[i];
