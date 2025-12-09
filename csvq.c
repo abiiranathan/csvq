@@ -26,9 +26,6 @@
 /** Maximum number of columns we support selecting/reordering. */
 #define MAX_SELECTED_COLUMNS 64
 
-/** Maximum number of AND conditions in a where clause. */
-#define MAX_WHERE_CONDITIONS 8
-
 /** ANSI color codes for column coloring. */
 static const char* COLUMN_COLORS[] = {
     "\033[36m",  // Cyan
@@ -51,6 +48,10 @@ static const char* COLUMN_COLORS[] = {
 /** ANSI reset code. */
 #define COLOR_RESET "\033[0m"
 
+/** ANSI background colors for alternating rows (stripped table). */
+static const char* BG_COLOR_EVEN = "\033[48;5;53m";  // Dark teal background for even rows
+static const char* BG_COLOR_ODD  = "";               // No background for odd rows
+
 /** Output format types. */
 typedef enum {
     OUTPUT_TABLE,     // ASCII table (default)
@@ -70,6 +71,12 @@ typedef enum {
     OP_GREATER_EQ,  // numeric >=
     OP_LESS_EQ,     // numeric <=
 } CompareOp;
+
+/** Logical operators for where clause conditions. */
+typedef enum {
+    LOGIC_AND,  // AND operator (all conditions must match)
+    LOGIC_OR,   // OR operator (at least one condition must match)
+} LogicOp;
 
 /** Where clause filter. */
 typedef struct {
@@ -92,18 +99,41 @@ typedef struct {
  */
 static unsigned long hidden_columns_mask = 0;
 
-/** Multiple where clauses combined with AND. */
-typedef struct {
-    WhereClause conditions[MAX_WHERE_CONDITIONS];
-    size_t count;
-} WhereFilter;
-
 /** Context for the qsort comparison function. */
 static struct {
     size_t col_idx;  // Index of column to sort by
     bool desc;       // Sort descending?
     bool active;     // Is sorting active?
 } sort_ctx = {0, false, false};
+
+// ===============================================================================
+// NEW AST BASED FILTER LOGIC
+// ===============================================================================
+
+/** AST Node types. */
+typedef enum { NODE_LOGIC, NODE_CONDITION } NodeType;
+
+/** AST Node structure. */
+typedef struct ASTNode {
+    NodeType type;
+
+    // For Logic Nodes
+    LogicOp logic_op;  // LOGIC_AND or LOGIC_OR
+    struct ASTNode* left;
+    struct ASTNode* right;
+
+    // For Condition Nodes
+    WhereClause* clause;  // The actual comparison logic
+} ASTNode;
+
+/** Wrapper for the AST Root to maintain compatibility with main(). */
+typedef struct {
+    ASTNode* root;
+} WhereFilter;
+
+// Forward declarations for the parser
+static ASTNode* parse_expression(char** stream);
+static void ast_free(ASTNode* node);
 
 /**
  * Marks a column as hidden.
@@ -252,12 +282,6 @@ static int compare_rows(const void* a, const void* b) {
  * @param name Column name to search for (case-sensitive).
  * @return Column index, or -1 if not found.
  */
-/**
- * Finds a column index by name in the header row.
- * @param header The header row.
- * @param name Column name to search for (case-sensitive).
- * @return Column index, or -1 if not found.
- */
 static ssize_t find_column_by_name(const Row* header, const char* name) {
     if (header == NULL || name == NULL) {
         return -1;
@@ -349,140 +373,299 @@ static bool parse_column_selection(const char* select_str, const Row* header, Co
 }
 
 /**
- * Parses a where clause string with AND support (e.g., "age > 25 AND name contains John").
- * @param where_str The where clause string.
- * @param filter Output WhereFilter structure. Caller must free with where_filter_free().
- * @return true on success, false on error.
+ * Trims whitespace from the beginning and end of a string in-place.
+ * Optimization: Uses a single pass to find the end and track trailing
+ * whitespace simultaneously, avoiding the double-scan of strlen().
  */
-static bool parse_where_clause(const char* where_str, WhereFilter* filter) {
-    if (where_str == NULL || where_str[0] == '\0' || filter == NULL) {
-        return false;
+static inline char* trim_string(char* str) {
+    if (!str) return NULL;
+
+    // 1. Trim leading whitespace
+    while (isspace((unsigned char)*str)) {
+        str++;
     }
 
-    filter->count = 0;
-
-    char* str_copy = strdup(where_str);
-    if (str_copy == NULL) {
-        return false;
+    // Optimization: If string is empty or all spaces, return early
+    if (*str == '\0') {
+        return str;
     }
 
-    // Split by AND (case-insensitive)
-    char* clause_str = str_copy;
+    // 2. Single-pass forward scan for trailing trim
+    // 'cursor' finds the null terminator.
+    // 'end' tracks the last seen non-space character.
+    char* end    = str;
+    char* cursor = str;
 
-    while (clause_str != NULL && filter->count < MAX_WHERE_CONDITIONS) {
-        // Find next AND (case-insensitive)
-        char* and_pos = strcasestr(clause_str, " AND ");
-        if (and_pos != NULL) {
-            *and_pos = '\0';
+    while (*cursor) {
+        if (!isspace((unsigned char)*cursor)) {
+            end = cursor;
         }
-
-        // Trim whitespace from clause
-        while (isspace((unsigned char)*clause_str)) {
-            clause_str++;
-        }
-        char* end = clause_str + strlen(clause_str) - 1;
-        while (end > clause_str && isspace((unsigned char)*end)) {
-            *end-- = '\0';
-        }
-
-        if (clause_str[0] == '\0') {
-            if (and_pos != NULL) {
-                clause_str = and_pos + 5;  // Skip " AND "
-                continue;
-            }
-            break;
-        }
-
-        // Parse individual condition
-        const char* operators[] = {">=", "<=", "!=", "contains", ">", "<", "="};
-        CompareOp ops[] = {OP_GREATER_EQ, OP_LESS_EQ, OP_NOT_EQUALS, OP_CONTAINS, OP_GREATER, OP_LESS, OP_EQUALS};
-        size_t num_ops  = sizeof(operators) / sizeof(operators[0]);
-
-        char* op_pos       = NULL;
-        CompareOp found_op = OP_CONTAINS;
-
-        for (size_t i = 0; i < num_ops; i++) {
-            char* pos = strstr(clause_str, operators[i]);
-            if (pos != NULL) {
-                op_pos   = pos;
-                found_op = ops[i];
-                break;
-            }
-        }
-
-        if (op_pos == NULL) {
-            fprintf(stderr, "Error: No valid operator in clause: %s\n", clause_str);
-            free(str_copy);
-            return false;
-        }
-
-        // Split into column name and value
-        *op_pos        = '\0';
-        char* col_name = clause_str;
-        char* value    = op_pos + strlen(operators[found_op == OP_GREATER_EQ   ? 0
-                                                   : found_op == OP_LESS_EQ    ? 1
-                                                   : found_op == OP_NOT_EQUALS ? 2
-                                                   : found_op == OP_CONTAINS   ? 3
-                                                   : found_op == OP_GREATER    ? 4
-                                                   : found_op == OP_LESS       ? 5
-                                                                               : 6]);
-
-        // Trim whitespace from both
-        while (isspace((unsigned char)*col_name))
-            col_name++;
-        end = col_name + strlen(col_name) - 1;
-        while (end > col_name && isspace((unsigned char)*end))
-            *end-- = '\0';
-
-        while (isspace((unsigned char)*value))
-            value++;
-        end = value + strlen(value) - 1;
-        while (end > value && isspace((unsigned char)*end))
-            *end-- = '\0';
-
-        if (col_name[0] == '\0' || value[0] == '\0') {
-            fprintf(stderr, "Error: Invalid where clause format\n");
-            free(str_copy);
-            return false;
-        }
-
-        WhereClause* clause = &filter->conditions[filter->count];
-        clause->column_name = strdup(col_name);
-        clause->value       = strdup(value);
-        clause->op          = found_op;
-        clause->column_idx  = (size_t)-1;
-        clause->is_numeric =
-            (found_op == OP_GREATER || found_op == OP_LESS || found_op == OP_GREATER_EQ || found_op == OP_LESS_EQ);
-
-        if (clause->column_name == NULL || clause->value == NULL) {
-            free(str_copy);
-            return false;
-        }
-
-        filter->count++;
-
-        if (and_pos != NULL) {
-            clause_str = and_pos + 5;  // Skip " AND "
-        } else {
-            break;
-        }
+        cursor++;
     }
 
-    free(str_copy);
-    return filter->count > 0;
+    // 3. Terminate after the last non-space character
+    *(end + 1) = '\0';
+
+    return str;
 }
 
 /**
- * Frees a WhereFilter structure.
- * @param filter The filter to free.
+ * Helper to parse a single raw condition string (e.g. "age > 25") into a WhereClause struct.
+ * This reuses the logic from your original linear parser but applies it to a leaf node.
  */
-static void where_filter_free(WhereFilter* filter) {
-    if (filter == NULL) {
-        return;
+static WhereClause* parse_single_condition(char* cond_str) {
+    // Trim input
+    cond_str = trim_string(cond_str);
+    if (!cond_str || !*cond_str) return NULL;
+
+    const char* operators[] = {">=", "<=", "!=", "contains", ">", "<", "="};
+    CompareOp ops[]         = {OP_GREATER_EQ, OP_LESS_EQ, OP_NOT_EQUALS, OP_CONTAINS, OP_GREATER, OP_LESS, OP_EQUALS};
+    size_t num_ops          = sizeof(operators) / sizeof(operators[0]);
+
+    char* op_pos       = NULL;
+    CompareOp found_op = OP_CONTAINS;
+
+    // Find operator
+    for (size_t i = 0; i < num_ops; i++) {
+        char* pos = strcasestr(cond_str, operators[i]);
+        if (pos != NULL) {
+            op_pos   = pos;
+            found_op = ops[i];
+            break;
+        }
     }
-    for (size_t i = 0; i < filter->count; i++) {
-        free(filter->conditions[i].column_name);
-        free(filter->conditions[i].value);
+
+    if (op_pos == NULL) {
+        fprintf(stderr, "Error: No valid operator in clause: '%s'\n", cond_str);
+        return NULL;
+    }
+
+    *op_pos        = '\0';  // Split string
+    char* col_name = cond_str;
+    char* value    = op_pos + strlen(operators[found_op == OP_GREATER_EQ   ? 0
+                                               : found_op == OP_LESS_EQ    ? 1
+                                               : found_op == OP_NOT_EQUALS ? 2
+                                               : found_op == OP_CONTAINS   ? 3
+                                               : found_op == OP_GREATER    ? 4
+                                               : found_op == OP_LESS       ? 5
+                                                                           : 6]);
+
+    col_name = trim_string(col_name);
+    value    = trim_string(value);
+
+    if (!col_name || !*col_name || !value) {  // Value can be empty string, but col cannot
+        return NULL;
+    }
+
+    WhereClause* wc = calloc(1, sizeof(WhereClause));
+    wc->column_name = strdup(col_name);
+    wc->value       = strdup(value);
+    wc->op          = found_op;
+    wc->column_idx  = (size_t)-1;
+    wc->is_numeric =
+        (found_op == OP_GREATER || found_op == OP_LESS || found_op == OP_GREATER_EQ || found_op == OP_LESS_EQ);
+
+    return wc;
+}
+
+/**
+ * Tokenizer helper.
+ * Peeks or consumes the next logical token.
+ * A "token" is (, ), AND, OR, or a raw condition string.
+ */
+static bool check_token(char** stream, const char* token) {
+    char* s = *stream;
+    while (isspace((unsigned char)*s))
+        s++;  // Skip whitespace
+
+    size_t len = strlen(token);
+    if (strncasecmp(s, token, len) == 0) {
+        // Ensure strictly whole word match for AND/OR
+        if (isalpha((unsigned char)token[0])) {
+            char next = s[len];
+            if (isalnum((unsigned char)next) || next == '_') return false;
+        }
+        *stream = s + len;
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Parses a "Factor": ( Expression ) OR Condition
+ */
+static ASTNode* parse_factor(char** stream) {
+    char* s = *stream;
+    while (isspace((unsigned char)*s))
+        s++;
+    *stream = s;
+
+    // 1. Check for Parentheses
+    if (check_token(stream, "(")) {
+        ASTNode* node = parse_expression(stream);
+        if (!check_token(stream, ")")) {
+            fprintf(stderr, "Error: Mismatched parentheses.\n");
+            ast_free(node);
+            return NULL;
+        }
+        return node;
+    }
+
+    // 2. Parse Condition (Read until AND, OR, ), or End)
+    char* start  = *stream;
+    char* cursor = start;
+
+    // Advance cursor until we hit a reserved word or char
+    while (*cursor) {
+        if (*cursor == '(' || *cursor == ')') break;
+
+        // Check for " AND " or " OR " boundaries (case insensitive)
+        if (strncasecmp(cursor, " AND ", 5) == 0 || strncasecmp(cursor, " OR ", 4) == 0) {
+            break;
+        }
+
+        // Handle end of string check for keywords at exact end?
+        // Logic handles this by trimming.
+        cursor++;
+    }
+
+    size_t len = (size_t)(cursor - start);
+    if (len == 0) return NULL;  // Empty condition
+
+    char* cond_buf = calloc(1, len + 1);
+    strncpy(cond_buf, start, len);
+
+    WhereClause* wc = parse_single_condition(cond_buf);
+    free(cond_buf);
+    *stream = cursor;  // Advance stream
+
+    if (!wc) return NULL;
+
+    ASTNode* node = calloc(1, sizeof(ASTNode));
+    node->type    = NODE_CONDITION;
+    node->clause  = wc;
+    return node;
+}
+
+/**
+ * Parses a "Term": Factor { AND Factor }
+ * AND binds tighter than OR.
+ */
+static ASTNode* parse_term(char** stream) {
+    ASTNode* left = parse_factor(stream);
+    if (!left) return NULL;
+
+    while (check_token(stream, "AND")) {
+        ASTNode* right = parse_factor(stream);
+        if (!right) {
+            fprintf(stderr, "Error: Missing operand after AND\n");
+            ast_free(left);
+            return NULL;
+        }
+
+        ASTNode* parent  = calloc(1, sizeof(ASTNode));
+        parent->type     = NODE_LOGIC;
+        parent->logic_op = LOGIC_AND;
+        parent->left     = left;
+        parent->right    = right;
+        left             = parent;
+    }
+    return left;
+}
+
+/**
+ * Parses an "Expression": Term { OR Term }
+ */
+static ASTNode* parse_expression(char** stream) {
+    ASTNode* left = parse_term(stream);
+    if (!left) return NULL;
+
+    while (check_token(stream, "OR")) {
+        ASTNode* right = parse_term(stream);
+        if (!right) {
+            fprintf(stderr, "Error: Missing operand after OR\n");
+            ast_free(left);
+            return NULL;
+        }
+
+        ASTNode* parent  = calloc(1, sizeof(ASTNode));
+        parent->type     = NODE_LOGIC;
+        parent->logic_op = LOGIC_OR;
+        parent->left     = left;
+        parent->right    = right;
+        left             = parent;
+    }
+    return left;
+}
+
+/**
+ * Entry point for parsing the where clause.
+ */
+static bool parse_where_clause(const char* where_str, WhereFilter* filter) {
+    if (!where_str || !*where_str || !filter) return false;
+
+    char* input  = strdup(where_str);
+    char* cursor = input;
+
+    filter->root = parse_expression(&cursor);
+
+    // Check if we consumed the whole string (ignoring trailing spaces)
+    while (isspace((unsigned char)*cursor))
+        cursor++;
+
+    if (*cursor != '\0') {
+        fprintf(stderr, "Error: Unexpected characters at end of where clause: '%s'\n", cursor);
+        ast_free(filter->root);
+        filter->root = NULL;
+        free(input);
+        return false;
+    }
+
+    free(input);
+    return (filter->root != NULL);
+}
+
+/**
+ * Recursively frees the AST.
+ */
+static void ast_free(ASTNode* node) {
+    if (!node) return;
+
+    if (node->type == NODE_LOGIC) {
+        ast_free(node->left);
+        ast_free(node->right);
+    } else if (node->type == NODE_CONDITION && node->clause) {
+        free(node->clause->column_name);
+        free(node->clause->value);
+        free(node->clause);
+    }
+    free(node);
+}
+
+static void where_filter_free(WhereFilter* filter) {
+    if (filter) {
+        ast_free(filter->root);
+        filter->root = NULL;
+    }
+}
+
+// Helper for Resolving Column Indices (Recursive)
+static void resolve_ast_indices(ASTNode* node, const Row* header) {
+    if (!node) return;
+
+    if (node->type == NODE_LOGIC) {
+        resolve_ast_indices(node->left, header);
+        resolve_ast_indices(node->right, header);
+    } else if (node->type == NODE_CONDITION) {
+        if (node->clause->column_idx == (size_t)-1) {
+            ssize_t idx = find_column_by_name(header, node->clause->column_name);
+            if (idx >= 0) {
+                node->clause->column_idx = (size_t)idx;
+            } else {
+                fprintf(stderr, "Warning: Column '%s' in where clause not found in header.\n",
+                        node->clause->column_name);
+            }
+        }
     }
 }
 
@@ -549,23 +732,28 @@ static bool evaluate_where_clause(const Row* row, const WhereClause* clause) {
 }
 
 /**
- * Evaluates a where filter (all conditions must match - AND logic).
- * @param row The row to check.
- * @param filter The where filter.
- * @return true if the row matches all conditions, false otherwise.
+ * Recursive evaluator for the AST.
  */
-static bool evaluate_where_filter(const Row* row, const WhereFilter* filter) {
-    if (row == NULL || filter == NULL || filter->count == 0) {
-        return true;
-    }
+static bool eval_ast(const Row* row, const ASTNode* node) {
+    if (!node) return true;
 
-    // All conditions must match (AND logic)
-    for (size_t i = 0; i < filter->count; i++) {
-        if (!evaluate_where_clause(row, &filter->conditions[i])) {
-            return false;
+    if (node->type == NODE_LOGIC) {
+        bool l_res = eval_ast(row, node->left);
+        // Short-circuit logic
+        if (node->logic_op == LOGIC_AND) {
+            return l_res ? eval_ast(row, node->right) : false;
+        } else {  // LOGIC_OR
+            return l_res ? true : eval_ast(row, node->right);
         }
+    } else {
+        // NODE_CONDITION
+        return evaluate_where_clause(row, node->clause);
     }
-    return true;
+}
+
+static bool evaluate_where_filter(const Row* row, const WhereFilter* filter) {
+    if (!filter || !filter->root) return true;
+    return eval_ast(row, filter->root);
 }
 
 /**
@@ -629,6 +817,19 @@ static void compute_column_widths(Row** rows, size_t row_count, size_t col_count
             }
         }
     }
+}
+
+/**
+ * Gets the background color code for a given row (alternating pattern).
+ * @param row_index Row index (0-based, for alternating pattern).
+ * @param use_colors Whether colors are enabled.
+ * @return ANSI background color code string, or empty string if colors disabled.
+ */
+static inline const char* get_row_bg_color(size_t row_index, bool use_bgcolor) {
+    if (!use_bgcolor) {
+        return "";
+    }
+    return (row_index % 2 == 0) ? BG_COLOR_EVEN : BG_COLOR_ODD;
 }
 
 /**
@@ -769,15 +970,18 @@ static void print_sanitized_field(const char* str) {
  * @param selection Optional column selection (NULL for all columns).
  * @param header Optional header row for JSON field names (NULL if not JSON).
  * @param is_last_row Whether this is the last row (for JSON formatting).
+ * @param row_index Row index for background coloring (0-based).
  */
 static void print_row_format(const Row* row, const size_t* widths, size_t col_count, OutputFormat format,
-                             bool use_colors, const ColumnSelection* selection, const Row* header, bool is_last_row) {
+                             bool use_colors, bool use_bgcolor, const ColumnSelection* selection, const Row* header,
+                             bool is_last_row, size_t row_index) {
     if (row == NULL) {
         return;
     }
 
     switch (format) {
         case OUTPUT_TABLE: {
+            const char* bg_color = get_row_bg_color(row_index, use_bgcolor);
             putchar('|');
             for (size_t i = 0; i < col_count; i++) {
                 size_t col = selection != NULL ? selection->indices[i] : i;
@@ -802,7 +1006,8 @@ static void print_row_format(const Row* row, const size_t* widths, size_t col_co
                 const char* color = get_column_color(i, use_colors);
                 const char* reset = get_color_reset(use_colors);
 
-                // Print color code
+                // Print background color, then column color
+                fputs(bg_color, stdout);
                 fputs(color, stdout);
 
                 // Print content space-by-space.
@@ -981,7 +1186,8 @@ static void print_markdown_separator(size_t col_count, const ColumnSelection* se
  * @param selection Optional column selection (NULL for all columns).
  */
 static void print_table(Row** rows, size_t row_count, bool has_header, OutputFormat format, bool use_colors,
-                        const char* filter_pattern, WhereFilter* where, const ColumnSelection* selection) {
+                        bool use_bgcolor, const char* filter_pattern, WhereFilter* where,
+                        const ColumnSelection* selection) {
     if (row_count == 0 || rows[0]->count == 0) {
         fprintf(stderr, "Error: No data to print\n");
         return;
@@ -992,16 +1198,7 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
 
     // Resolve where clause column indices if present
     if (where != NULL && has_header) {
-        for (size_t i = 0; i < where->count; i++) {
-            if (where->conditions[i].column_idx == (size_t)-1) {
-                ssize_t idx = find_column_by_name(rows[0], where->conditions[i].column_name);
-                if (idx < 0) {
-                    fprintf(stderr, "Error: Column '%s' not found in where clause\n", where->conditions[i].column_name);
-                    return;
-                }
-                where->conditions[i].column_idx = (size_t)idx;
-            }
-        }
+        resolve_ast_indices(where->root, rows[0]);
     }
 
     size_t* widths = NULL;
@@ -1032,7 +1229,7 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
         // Skip printing the header row itself for JSON output.
         // For JSON, the header is only used to generate keys for data rows.
         if (format != OUTPUT_JSON) {
-            print_row_format(rows[0], widths, col_count, format, use_colors, selection, NULL, false);
+            print_row_format(rows[0], widths, col_count, format, use_colors, use_bgcolor, selection, NULL, false, 0);
             if (format == OUTPUT_TABLE) {
                 print_separator(widths, col_count, use_colors, selection);
             } else if (format == OUTPUT_MARKDOWN) {
@@ -1045,6 +1242,7 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
     }
 
     // Print data rows (with filtering)
+    size_t data_row_index = 0;  // Track actual data row index for background coloring
     for (size_t i = start_row; i < row_count; i++) {
         bool matches = row_matches_filter(rows[i], filter_pattern);
         if (matches && where != NULL) {
@@ -1076,8 +1274,10 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
                 }
             }
 
-            print_row_format(rows[i], widths, col_count, format, use_colors, selection, header, is_last);
+            print_row_format(rows[i], widths, col_count, format, use_colors, use_bgcolor, selection, header, is_last,
+                             data_row_index);
             printed_rows++;
+            data_row_index++;
         }
     }
 
@@ -1110,6 +1310,7 @@ int main(int argc, char* argv[]) {
     bool has_header      = true;
     bool skip_header     = false;
     bool use_colors      = false;
+    bool use_bgcolor     = false;
     char comment         = '#';
     char* delim_arg      = ",";
     char* hide_cols      = NULL;
@@ -1124,13 +1325,15 @@ int main(int argc, char* argv[]) {
     flag_size_t(parser, "memory", 'm', "Maximum memory in bytes to use", &max_memory);
     flag_bool(parser, "header", 'h', "The CSV file has a header", &has_header);
     flag_bool(parser, "skip-header", 's', "Skip the header", &skip_header);
-    flag_bool(parser, "color", 'C', "Use colors for each column", &use_colors);
+    flag_bool(parser, "color", 'C', "Use text colors for each column", &use_colors);
+    flag_bool(parser, "bgcolor", 'G', "Use background color for rows", &use_bgcolor);
     flag_bool(parser, "desc", 'D', "Sort in descending order", &sort_desc);
     flag_char(parser, "comment", 'c', "Comment Character", &comment);
     flag_string(parser, "delimiter", 'd', "The CSV delimiter (use '\\t' for tab)", &delim_arg);
     flag_string(parser, "hide", 'H', "Comma-separated column indices to hide (e.g., 0,2,5)", &hide_cols);
     flag_string(parser, "filter", 'f', "Show only rows containing this pattern", &filter_pattern);
-    flag_string(parser, "where", 'w', "Filter rows with condition (e.g., 'age > 25', 'name contains John')",
+    flag_string(parser, "where", 'w',
+                "Filter rows with condition (e.g., 'age > 25', 'name contains John' or 'age > 25 OR status = active')",
                 &where_str);
     flag_string(parser, "select", 'S', "Select and order columns (e.g., 'name,age' or '0,2,1')", &select_str);
     flag_string(parser, "output", 'o', "Output format: table (default), csv, tsv, json, markdown", &format_str);
@@ -1278,7 +1481,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    print_table(rows, count, has_header, format, use_colors, filter_pattern, where_ptr, sel_ptr);
+    print_table(rows, count, has_header, format, use_colors, use_bgcolor, filter_pattern, where_ptr, sel_ptr);
     where_filter_free(where_ptr);
     csv_reader_free(reader);
     flag_parser_free(parser);
