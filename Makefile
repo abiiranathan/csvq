@@ -1,6 +1,6 @@
 # Makefile for csvq
 # TODO: Integrate solidc compilation for multiple targets.
-SRC=csvq.c
+SRC=csvq.c where-parser.c
 TARGET=csvq
 TARGET_WIN=csvq.exe
 TARGET_MAC_INTEL=csvq-macos-x86_64

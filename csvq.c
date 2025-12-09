@@ -16,6 +16,8 @@
 #include <stdlib.h>            // for EXIT_FAILURE, EXIT_SUCCESS, malloc, free, calloc
 #include <string.h>            // for strlen, strcasestr, strcmp, strdup
 #include <strings.h>           // for strcasecmp
+#include "str.h"
+#include "where-parser.h"
 
 /** Minimum column width for aesthetics. */
 #define MIN_COLUMN_WIDTH 3
@@ -49,8 +51,8 @@ static const char* COLUMN_COLORS[] = {
 #define COLOR_RESET "\033[0m"
 
 /** ANSI background colors for alternating rows (stripped table). */
-static const char* BG_COLOR_EVEN = "\033[48;5;53m";  // Dark teal background for even rows
-static const char* BG_COLOR_ODD  = "";               // No background for odd rows
+static const char* BG_COLOR_EVEN = "\033[48;5;236m";  // Dark teal background for even rows
+static const char* BG_COLOR_ODD  = "";                // No background for odd rows
 
 /** Output format types. */
 typedef enum {
@@ -60,32 +62,6 @@ typedef enum {
     OUTPUT_JSON,      // JSON array of objects
     OUTPUT_MARKDOWN,  // Markdown table
 } OutputFormat;
-
-/** Comparison operators for where clause. */
-typedef enum {
-    OP_CONTAINS,    // case-insensitive substring match
-    OP_EQUALS,      // case-insensitive equality
-    OP_NOT_EQUALS,  // case-insensitive inequality
-    OP_GREATER,     // numeric >
-    OP_LESS,        // numeric <
-    OP_GREATER_EQ,  // numeric >=
-    OP_LESS_EQ,     // numeric <=
-} CompareOp;
-
-/** Logical operators for where clause conditions. */
-typedef enum {
-    LOGIC_AND,  // AND operator (all conditions must match)
-    LOGIC_OR,   // OR operator (at least one condition must match)
-} LogicOp;
-
-/** Where clause filter. */
-typedef struct {
-    char* column_name;  // Column name to filter on
-    size_t column_idx;  // Resolved column index
-    CompareOp op;       // Comparison operator
-    char* value;        // Value to compare against
-    bool is_numeric;    // Whether to treat value as numeric
-} WhereClause;
 
 /** Column selection/reordering. */
 typedef struct {
@@ -105,35 +81,6 @@ static struct {
     bool desc;       // Sort descending?
     bool active;     // Is sorting active?
 } sort_ctx = {0, false, false};
-
-// ===============================================================================
-// NEW AST BASED FILTER LOGIC
-// ===============================================================================
-
-/** AST Node types. */
-typedef enum { NODE_LOGIC, NODE_CONDITION } NodeType;
-
-/** AST Node structure. */
-typedef struct ASTNode {
-    NodeType type;
-
-    // For Logic Nodes
-    LogicOp logic_op;  // LOGIC_AND or LOGIC_OR
-    struct ASTNode* left;
-    struct ASTNode* right;
-
-    // For Condition Nodes
-    WhereClause* clause;  // The actual comparison logic
-} ASTNode;
-
-/** Wrapper for the AST Root to maintain compatibility with main(). */
-typedef struct {
-    ASTNode* root;
-} WhereFilter;
-
-// Forward declarations for the parser
-static ASTNode* parse_expression(char** stream);
-static void ast_free(ASTNode* node);
 
 /**
  * Marks a column as hidden.
@@ -202,43 +149,6 @@ static int parse_hidden_columns(const char* columns_str) {
     return count;
 }
 
-#ifdef _WIN32
-#include <ctype.h>
-#include <string.h>
-
-static char* strcasestr(const char* haystack, const char* needle) {
-    if (needle == NULL || *needle == '\0') {
-        return (char*)haystack;
-    }
-
-    const size_t needle_len   = strlen(needle);
-    const size_t haystack_len = strlen(haystack);
-
-    if (needle_len > haystack_len) {
-        return NULL;
-    }
-
-    const size_t search_len = haystack_len - needle_len + 1;
-
-    for (size_t i = 0; i < search_len; i++) {
-        if (tolower((unsigned char)haystack[i]) == tolower((unsigned char)needle[0])) {
-            bool match = true;
-            for (size_t j = 1; j < needle_len; j++) {
-                if (tolower((unsigned char)haystack[i + j]) != tolower((unsigned char)needle[j])) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) {
-                return (char*)(haystack + i);
-            }
-        }
-    }
-
-    return NULL;
-}
-#endif
-
 /**
  * Comparator function for qsort.
  * Tries to compare numerically first; falls back to string comparison.
@@ -282,7 +192,7 @@ static int compare_rows(const void* a, const void* b) {
  * @param name Column name to search for (case-sensitive).
  * @return Column index, or -1 if not found.
  */
-static ssize_t find_column_by_name(const Row* header, const char* name) {
+ssize_t find_column_by_name(const Row* header, const char* name) {
     if (header == NULL || name == NULL) {
         return -1;
     }
@@ -370,390 +280,6 @@ static bool parse_column_selection(const char* select_str, const Row* header, Co
 
     free(str_copy);
     return selection->count > 0;
-}
-
-/**
- * Trims whitespace from the beginning and end of a string in-place.
- * Optimization: Uses a single pass to find the end and track trailing
- * whitespace simultaneously, avoiding the double-scan of strlen().
- */
-static inline char* trim_string(char* str) {
-    if (!str) return NULL;
-
-    // 1. Trim leading whitespace
-    while (isspace((unsigned char)*str)) {
-        str++;
-    }
-
-    // Optimization: If string is empty or all spaces, return early
-    if (*str == '\0') {
-        return str;
-    }
-
-    // 2. Single-pass forward scan for trailing trim
-    // 'cursor' finds the null terminator.
-    // 'end' tracks the last seen non-space character.
-    char* end    = str;
-    char* cursor = str;
-
-    while (*cursor) {
-        if (!isspace((unsigned char)*cursor)) {
-            end = cursor;
-        }
-        cursor++;
-    }
-
-    // 3. Terminate after the last non-space character
-    *(end + 1) = '\0';
-
-    return str;
-}
-
-/**
- * Helper to parse a single raw condition string (e.g. "age > 25") into a WhereClause struct.
- * This reuses the logic from your original linear parser but applies it to a leaf node.
- */
-static WhereClause* parse_single_condition(char* cond_str) {
-    // Trim input
-    cond_str = trim_string(cond_str);
-    if (!cond_str || !*cond_str) return NULL;
-
-    const char* operators[] = {">=", "<=", "!=", "contains", ">", "<", "="};
-    CompareOp ops[]         = {OP_GREATER_EQ, OP_LESS_EQ, OP_NOT_EQUALS, OP_CONTAINS, OP_GREATER, OP_LESS, OP_EQUALS};
-    size_t num_ops          = sizeof(operators) / sizeof(operators[0]);
-
-    char* op_pos       = NULL;
-    CompareOp found_op = OP_CONTAINS;
-
-    // Find operator
-    for (size_t i = 0; i < num_ops; i++) {
-        char* pos = strcasestr(cond_str, operators[i]);
-        if (pos != NULL) {
-            op_pos   = pos;
-            found_op = ops[i];
-            break;
-        }
-    }
-
-    if (op_pos == NULL) {
-        fprintf(stderr, "Error: No valid operator in clause: '%s'\n", cond_str);
-        return NULL;
-    }
-
-    *op_pos        = '\0';  // Split string
-    char* col_name = cond_str;
-    char* value    = op_pos + strlen(operators[found_op == OP_GREATER_EQ   ? 0
-                                               : found_op == OP_LESS_EQ    ? 1
-                                               : found_op == OP_NOT_EQUALS ? 2
-                                               : found_op == OP_CONTAINS   ? 3
-                                               : found_op == OP_GREATER    ? 4
-                                               : found_op == OP_LESS       ? 5
-                                                                           : 6]);
-
-    col_name = trim_string(col_name);
-    value    = trim_string(value);
-
-    if (!col_name || !*col_name || !value) {  // Value can be empty string, but col cannot
-        return NULL;
-    }
-
-    WhereClause* wc = calloc(1, sizeof(WhereClause));
-    wc->column_name = strdup(col_name);
-    wc->value       = strdup(value);
-    wc->op          = found_op;
-    wc->column_idx  = (size_t)-1;
-    wc->is_numeric =
-        (found_op == OP_GREATER || found_op == OP_LESS || found_op == OP_GREATER_EQ || found_op == OP_LESS_EQ);
-
-    return wc;
-}
-
-/**
- * Tokenizer helper.
- * Peeks or consumes the next logical token.
- * A "token" is (, ), AND, OR, or a raw condition string.
- */
-static bool check_token(char** stream, const char* token) {
-    char* s = *stream;
-    while (isspace((unsigned char)*s))
-        s++;  // Skip whitespace
-
-    size_t len = strlen(token);
-    if (strncasecmp(s, token, len) == 0) {
-        // Ensure strictly whole word match for AND/OR
-        if (isalpha((unsigned char)token[0])) {
-            char next = s[len];
-            if (isalnum((unsigned char)next) || next == '_') return false;
-        }
-        *stream = s + len;
-        return true;
-    }
-    return false;
-}
-
-/**
- * Parses a "Factor": ( Expression ) OR Condition
- */
-static ASTNode* parse_factor(char** stream) {
-    char* s = *stream;
-    while (isspace((unsigned char)*s))
-        s++;
-    *stream = s;
-
-    // 1. Check for Parentheses
-    if (check_token(stream, "(")) {
-        ASTNode* node = parse_expression(stream);
-        if (!check_token(stream, ")")) {
-            fprintf(stderr, "Error: Mismatched parentheses.\n");
-            ast_free(node);
-            return NULL;
-        }
-        return node;
-    }
-
-    // 2. Parse Condition (Read until AND, OR, ), or End)
-    char* start  = *stream;
-    char* cursor = start;
-
-    // Advance cursor until we hit a reserved word or char
-    while (*cursor) {
-        if (*cursor == '(' || *cursor == ')') break;
-
-        // Check for " AND " or " OR " boundaries (case insensitive)
-        if (strncasecmp(cursor, " AND ", 5) == 0 || strncasecmp(cursor, " OR ", 4) == 0) {
-            break;
-        }
-
-        // Handle end of string check for keywords at exact end?
-        // Logic handles this by trimming.
-        cursor++;
-    }
-
-    size_t len = (size_t)(cursor - start);
-    if (len == 0) return NULL;  // Empty condition
-
-    char* cond_buf = calloc(1, len + 1);
-    strncpy(cond_buf, start, len);
-
-    WhereClause* wc = parse_single_condition(cond_buf);
-    free(cond_buf);
-    *stream = cursor;  // Advance stream
-
-    if (!wc) return NULL;
-
-    ASTNode* node = calloc(1, sizeof(ASTNode));
-    node->type    = NODE_CONDITION;
-    node->clause  = wc;
-    return node;
-}
-
-/**
- * Parses a "Term": Factor { AND Factor }
- * AND binds tighter than OR.
- */
-static ASTNode* parse_term(char** stream) {
-    ASTNode* left = parse_factor(stream);
-    if (!left) return NULL;
-
-    while (check_token(stream, "AND")) {
-        ASTNode* right = parse_factor(stream);
-        if (!right) {
-            fprintf(stderr, "Error: Missing operand after AND\n");
-            ast_free(left);
-            return NULL;
-        }
-
-        ASTNode* parent  = calloc(1, sizeof(ASTNode));
-        parent->type     = NODE_LOGIC;
-        parent->logic_op = LOGIC_AND;
-        parent->left     = left;
-        parent->right    = right;
-        left             = parent;
-    }
-    return left;
-}
-
-/**
- * Parses an "Expression": Term { OR Term }
- */
-static ASTNode* parse_expression(char** stream) {
-    ASTNode* left = parse_term(stream);
-    if (!left) return NULL;
-
-    while (check_token(stream, "OR")) {
-        ASTNode* right = parse_term(stream);
-        if (!right) {
-            fprintf(stderr, "Error: Missing operand after OR\n");
-            ast_free(left);
-            return NULL;
-        }
-
-        ASTNode* parent  = calloc(1, sizeof(ASTNode));
-        parent->type     = NODE_LOGIC;
-        parent->logic_op = LOGIC_OR;
-        parent->left     = left;
-        parent->right    = right;
-        left             = parent;
-    }
-    return left;
-}
-
-/**
- * Entry point for parsing the where clause.
- */
-static bool parse_where_clause(const char* where_str, WhereFilter* filter) {
-    if (!where_str || !*where_str || !filter) return false;
-
-    char* input  = strdup(where_str);
-    char* cursor = input;
-
-    filter->root = parse_expression(&cursor);
-
-    // Check if we consumed the whole string (ignoring trailing spaces)
-    while (isspace((unsigned char)*cursor))
-        cursor++;
-
-    if (*cursor != '\0') {
-        fprintf(stderr, "Error: Unexpected characters at end of where clause: '%s'\n", cursor);
-        ast_free(filter->root);
-        filter->root = NULL;
-        free(input);
-        return false;
-    }
-
-    free(input);
-    return (filter->root != NULL);
-}
-
-/**
- * Recursively frees the AST.
- */
-static void ast_free(ASTNode* node) {
-    if (!node) return;
-
-    if (node->type == NODE_LOGIC) {
-        ast_free(node->left);
-        ast_free(node->right);
-    } else if (node->type == NODE_CONDITION && node->clause) {
-        free(node->clause->column_name);
-        free(node->clause->value);
-        free(node->clause);
-    }
-    free(node);
-}
-
-static void where_filter_free(WhereFilter* filter) {
-    if (filter) {
-        ast_free(filter->root);
-        filter->root = NULL;
-    }
-}
-
-// Helper for Resolving Column Indices (Recursive)
-static void resolve_ast_indices(ASTNode* node, const Row* header) {
-    if (!node) return;
-
-    if (node->type == NODE_LOGIC) {
-        resolve_ast_indices(node->left, header);
-        resolve_ast_indices(node->right, header);
-    } else if (node->type == NODE_CONDITION) {
-        if (node->clause->column_idx == (size_t)-1) {
-            ssize_t idx = find_column_by_name(header, node->clause->column_name);
-            if (idx >= 0) {
-                node->clause->column_idx = (size_t)idx;
-            } else {
-                fprintf(stderr, "Warning: Column '%s' in where clause not found in header.\n",
-                        node->clause->column_name);
-            }
-        }
-    }
-}
-
-/**
- * Evaluates a where clause against a row.
- * @param row The row to check.
- * @param clause The where clause.
- * @return true if the row matches the clause, false otherwise.
- */
-static bool evaluate_where_clause(const Row* row, const WhereClause* clause) {
-    if (row == NULL || clause == NULL) {
-        return true;
-    }
-
-    if (clause->column_idx >= row->count) {
-        return false;
-    }
-
-    const char* field = row->fields[clause->column_idx];
-    if (field == NULL) {
-        field = "";
-    }
-
-    switch (clause->op) {
-        case OP_CONTAINS:
-            return strcasestr(field, clause->value) != NULL;
-
-        case OP_EQUALS:
-            return strcasecmp(field, clause->value) == 0;
-
-        case OP_NOT_EQUALS:
-            return strcasecmp(field, clause->value) != 0;
-
-        case OP_GREATER:
-        case OP_LESS:
-        case OP_GREATER_EQ:
-        case OP_LESS_EQ: {
-            char* field_end;
-            char* value_end;
-            double field_num = strtod(field, &field_end);
-            double value_num = strtod(clause->value, &value_end);
-
-            // Check if both parsed successfully
-            if (*field_end != '\0' || *value_end != '\0') {
-                return false;  // Not numeric
-            }
-
-            switch (clause->op) {
-                case OP_GREATER:
-                    return field_num > value_num;
-                case OP_LESS:
-                    return field_num < value_num;
-                case OP_GREATER_EQ:
-                    return field_num >= value_num;
-                case OP_LESS_EQ:
-                    return field_num <= value_num;
-                default:
-                    return false;
-            }
-        }
-    }
-
-    return false;
-}
-
-/**
- * Recursive evaluator for the AST.
- */
-static bool eval_ast(const Row* row, const ASTNode* node) {
-    if (!node) return true;
-
-    if (node->type == NODE_LOGIC) {
-        bool l_res = eval_ast(row, node->left);
-        // Short-circuit logic
-        if (node->logic_op == LOGIC_AND) {
-            return l_res ? eval_ast(row, node->right) : false;
-        } else {  // LOGIC_OR
-            return l_res ? true : eval_ast(row, node->right);
-        }
-    } else {
-        // NODE_CONDITION
-        return evaluate_where_clause(row, node->clause);
-    }
-}
-
-static bool evaluate_where_filter(const Row* row, const WhereFilter* filter) {
-    if (!filter || !filter->root) return true;
-    return eval_ast(row, filter->root);
 }
 
 /**
@@ -886,22 +412,16 @@ static void print_separator(const size_t* widths, size_t col_count, bool use_col
  * @param str The string to process.
  * @return Allocated string with whitespace trimmed and special chars escaped. Caller must free.
  */
-static char* trim_and_escape_json(const char* str) {
-    if (str == NULL) {
+static char* trim_and_escape_json(const char* s) {
+    if (s == NULL) {
         return strdup("");
     }
 
-    // 1. Trim leading whitespace
-    const char* start = str;
-    while (isspace((unsigned char)*start)) {
-        start++;
-    }
+    char* str = (char*)s;
+    str       = trim_string(str);
 
-    // 2. Calculate trimmed length (excluding trailing whitespace)
-    size_t len = strlen(start);
-    while (len > 0 && isspace((unsigned char)start[len - 1])) {
-        len--;
-    }
+    // Get length of trimmed string.
+    size_t len = strlen(str);
 
     // 3. Allocate memory (Worst case: every char needs escaping \x -> \\x)
     char* escaped = malloc(len * 2 + 1);
@@ -912,7 +432,7 @@ static char* trim_and_escape_json(const char* str) {
     // 4. Escape characters within the trimmed range
     size_t j = 0;
     for (size_t i = 0; i < len; i++) {
-        char c = start[i];
+        char c = str[i];
         switch (c) {
             case '"':
                 escaped[j++] = '\\';

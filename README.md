@@ -110,7 +110,6 @@ Contributions are what make the open-source community such an amazing place to l
 
 ### Ideas for Contribution
 *   Add support for HTML table output.
-*   Implement `OR` logic in where clauses.
 *   Add aggregate functions (Sum/Average of a column).
 
 ## 📜 License
