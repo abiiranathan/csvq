@@ -24,6 +24,9 @@ MAC_INC=/usr/local/include
 $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) -L$(NATIVE_LIB) -I$(NATIVE_INC) -o $@ $^ $(LDFLAGS)
 
+debug: $(SRC)
+	$(CC) -g -O0 -Wall -Wextra -L$(NATIVE_LIB) -I$(NATIVE_INC) -o $(TARGET) $^ $(LDFLAGS)
+
 windows: $(SRC)
 	zig cc $(CFLAGS) -target x86_64-windows-gnu -L$(WIN_LIB) -I$(WIN_INC) -o $(TARGET_WIN) $^ $(LDFLAGS)
 

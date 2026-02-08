@@ -6,8 +6,7 @@
 #include <string.h>
 
 // Forward declarations for the parser
-static ASTNode* parse_expression(char** stream);
-static void ast_free(ASTNode* node);
+static ASTNode* parse_expression(Arena* arena, char** stream);
 
 /**
  * Finds a column index by name in the header row.
@@ -22,7 +21,7 @@ extern ssize_t find_column_by_name(const Row* header, const char* name);
  * Helper to parse a single raw condition string (e.g. "age > 25") into a WhereClause struct.
  * This reuses the logic from your original linear parser but applies it to a leaf node.
  */
-static WhereClause* parse_single_condition(char* cond_str) {
+static WhereClause* parse_single_condition(Arena* arena, char* cond_str) {
     // Trim input
     cond_str = trim_string(cond_str);
     if (!cond_str || !*cond_str) return NULL;
@@ -90,22 +89,21 @@ static WhereClause* parse_single_condition(char* cond_str) {
         return NULL;
     }
 
-    WhereClause* wc = calloc(1, sizeof(WhereClause));
+    WhereClause* wc = ARENA_ALLOC_ZERO(arena, WhereClause);
     if (!wc) {
         fprintf(stderr, "Error: Memory allocation failed for WhereClause\n");
         return NULL;
     }
-    wc->column_name = strdup(col_name);
+    wc->column_name = arena_strdup(arena, col_name);
     if (!wc->column_name) {
         fprintf(stderr, "Error: Memory allocation failed for column name\n");
-        free(wc);
+        // No free needed for arena
         return NULL;
     }
-    wc->value = strdup(value);
+    wc->value = arena_strdup(arena, value);
     if (!wc->value) {
         fprintf(stderr, "Error: Memory allocation failed for value\n");
-        free(wc->column_name);
-        free(wc);
+        // No free needed for arena
         return NULL;
     }
 
@@ -144,7 +142,7 @@ static inline bool check_token(char** stream, const char* token) {
 /**
  * Parses a "Factor": ( Expression ) OR Condition
  */
-static ASTNode* parse_factor(char** stream) {
+static ASTNode* parse_factor(Arena* arena, char** stream) {
     if (!stream || !*stream) return NULL;
 
     char* s = *stream;
@@ -153,13 +151,13 @@ static ASTNode* parse_factor(char** stream) {
 
     // Check for Parentheses
     if (check_token(stream, "(")) {
-        ASTNode* node = parse_expression(stream);
+        ASTNode* node = parse_expression(arena, stream);
         // If expression parsing failed, propagate error
         if (!node) return NULL;
 
         if (!check_token(stream, ")")) {
             fprintf(stderr, "Error: Mismatched parentheses.\n");
-            ast_free(node);
+            // No free needed for arena
             return NULL;
         }
         return node;
@@ -186,7 +184,7 @@ static ASTNode* parse_factor(char** stream) {
     size_t len = (size_t)(cursor - start);
     if (len == 0) return NULL;  // Empty condition
 
-    // Check for calloc failure
+    // Temporary buffer for condition string - use standard malloc/free to keep arena clean of temp data
     char* cond_buf = calloc(1, len + 1);
     if (!cond_buf) {
         fprintf(stderr, "Error: Memory allocation failed for condition buffer\n");
@@ -194,20 +192,15 @@ static ASTNode* parse_factor(char** stream) {
     }
     strncpy(cond_buf, start, len);
 
-    WhereClause* wc = parse_single_condition(cond_buf);
+    WhereClause* wc = parse_single_condition(arena, cond_buf);
     free(cond_buf);
     *stream = cursor;  // Advance stream
 
     if (!wc) return NULL;
 
-    // Check for ASTNode allocation failure
-    ASTNode* node = calloc(1, sizeof(ASTNode));
+    ASTNode* node = ARENA_ALLOC_ZERO(arena, ASTNode);
     if (!node) {
         fprintf(stderr, "Error: Memory allocation failed for ASTNode\n");
-        // Free the WhereClause we just successfully parsed
-        free(wc->column_name);
-        free(wc->value);
-        free(wc);
         return NULL;
     }
 
@@ -220,23 +213,20 @@ static ASTNode* parse_factor(char** stream) {
  * Parses a "Term": Factor { AND Factor }
  * AND binds tighter than OR.
  */
-static ASTNode* parse_term(char** stream) {
-    ASTNode* left = parse_factor(stream);
+static ASTNode* parse_term(Arena* arena, char** stream) {
+    ASTNode* left = parse_factor(arena, stream);
     if (!left) return NULL;
 
     while (check_token(stream, "AND")) {
-        ASTNode* right = parse_factor(stream);
+        ASTNode* right = parse_factor(arena, stream);
         if (!right) {
             fprintf(stderr, "Error: Missing operand after AND\n");
-            ast_free(left);
             return NULL;
         }
 
-        ASTNode* parent = calloc(1, sizeof(ASTNode));
+        ASTNode* parent = ARENA_ALLOC_ZERO(arena, ASTNode);
         if (!parent) {
             fprintf(stderr, "Error: Memory allocation failed for AND Logic Node\n");
-            ast_free(left);
-            ast_free(right);
             return NULL;
         }
 
@@ -252,23 +242,20 @@ static ASTNode* parse_term(char** stream) {
 /**
  * Parses an "Expression": Term { OR Term }
  */
-static ASTNode* parse_expression(char** stream) {
-    ASTNode* left = parse_term(stream);
+static ASTNode* parse_expression(Arena* arena, char** stream) {
+    ASTNode* left = parse_term(arena, stream);
     if (!left) return NULL;
 
     while (check_token(stream, "OR")) {
-        ASTNode* right = parse_term(stream);
+        ASTNode* right = parse_term(arena, stream);
         if (!right) {
             fprintf(stderr, "Error: Missing operand after OR\n");
-            ast_free(left);
             return NULL;
         }
 
-        ASTNode* parent = calloc(1, sizeof(ASTNode));
+        ASTNode* parent = ARENA_ALLOC_ZERO(arena, ASTNode);
         if (!parent) {
             fprintf(stderr, "Error: Memory allocation failed for OR Logic Node\n");
-            ast_free(left);
-            ast_free(right);
             return NULL;
         }
 
@@ -284,9 +271,10 @@ static ASTNode* parse_expression(char** stream) {
 /**
  * Entry point for parsing the where clause.
  */
-bool parse_where_clause(const char* where_str, WhereFilter* filter) {
+bool parse_where_clause(Arena* arena, const char* where_str, WhereFilter* filter) {
     if (!where_str || !*where_str || !filter) return false;
 
+    // Use standard malloc/free for temporary parsing buffer
     char* input = strdup(where_str);
     if (!input) {
         fprintf(stderr, "Error: Memory allocation failed for where string copy\n");
@@ -295,7 +283,7 @@ bool parse_where_clause(const char* where_str, WhereFilter* filter) {
 
     char* cursor = input;
 
-    filter->root = parse_expression(&cursor);
+    filter->root = parse_expression(arena, &cursor);
 
     // Check if we parsed anything successfully
     if (!filter->root) {
@@ -308,7 +296,7 @@ bool parse_where_clause(const char* where_str, WhereFilter* filter) {
 
     if (*cursor != '\0') {
         fprintf(stderr, "Error: Unexpected characters at end of where clause: '%s'\n", cursor);
-        ast_free(filter->root);
+        // Arena will be freed later, no need to free partial AST
         filter->root = NULL;
         free(input);
         return false;
@@ -316,30 +304,6 @@ bool parse_where_clause(const char* where_str, WhereFilter* filter) {
 
     free(input);
     return (filter->root != NULL);
-}
-
-/**
- * Recursively frees the AST.
- */
-static void ast_free(ASTNode* node) {
-    if (!node) return;
-
-    if (node->type == NODE_LOGIC) {
-        ast_free(node->left);
-        ast_free(node->right);
-    } else if (node->type == NODE_CONDITION && node->clause) {
-        free(node->clause->column_name);
-        free(node->clause->value);
-        free(node->clause);
-    }
-    free(node);
-}
-
-void where_filter_free(WhereFilter* filter) {
-    if (filter) {
-        ast_free(filter->root);
-        filter->root = NULL;
-    }
 }
 
 // Helper for Resolving Column Indices (Recursive)

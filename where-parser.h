@@ -6,6 +6,7 @@ extern "C" {
 #endif
 
 #include <solidc/csvparser.h>
+#include <solidc/arena.h>
 #include "types.h"
 
 bool evaluate_where_filter(const Row* row, const WhereFilter* filter);
@@ -13,12 +14,11 @@ bool evaluate_where_filter(const Row* row, const WhereFilter* filter);
 /**
  * Entry point for parsing the where clause.
  */
-bool parse_where_clause(const char* where_str, WhereFilter* filter);
+bool parse_where_clause(Arena* arena, const char* where_str, WhereFilter* filter);
 
 // Helper function for Resolving Column Indices (Recursive)
 void resolve_ast_indices(ASTNode* node, const Row* header);
 
-void where_filter_free(WhereFilter* filter);
 
 #ifdef __cplusplus
 }
