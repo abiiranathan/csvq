@@ -16,7 +16,6 @@
 #include <stdlib.h>            // for EXIT_FAILURE, EXIT_SUCCESS, malloc, free, calloc
 #include <string.h>            // for strlen, strcasestr, strcmp, strdup
 #include <strings.h>           // for strcasecmp
-#include "str.h"
 #include "where-parser.h"
 
 /** Minimum column width for aesthetics. */
@@ -52,7 +51,7 @@ static const char* COLUMN_COLORS[] = {
 
 /** ANSI background colors for alternating rows (stripped table). */
 static const char* BG_COLOR_EVEN = "\033[48;5;236m";  // Dark teal background for even rows
-static const char* BG_COLOR_ODD  = "";                // No background for odd rows
+static const char* BG_COLOR_ODD = "";                 // No background for odd rows
 
 /** Output format types. */
 typedef enum {
@@ -373,9 +372,7 @@ static inline const char* get_column_color(size_t col, bool use_colors) {
  * @param use_colors Whether colors are enabled.
  * @return ANSI reset code string, or empty string if colors disabled.
  */
-static inline const char* get_color_reset(bool use_colors) {
-    return use_colors ? COLOR_RESET : "";
-}
+static inline const char* get_color_reset(bool use_colors) { return use_colors ? COLOR_RESET : ""; }
 
 /**
  * Prints a horizontal separator line for the table.
@@ -418,7 +415,7 @@ static char* trim_and_escape_json(const char* s) {
     }
 
     char* str = (char*)s;
-    str       = trim_string(str);
+    str = trim_string(str);
 
     // Get length of trimmed string.
     size_t len = strlen(str);
@@ -714,7 +711,7 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
     }
 
     size_t original_col_count = rows[0]->count;
-    size_t col_count          = selection != NULL ? selection->count : original_col_count;
+    size_t col_count = selection != NULL ? selection->count : original_col_count;
 
     // Resolve where clause column indices if present
     if (where != NULL && has_header) {
@@ -739,8 +736,8 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
     }
 
     size_t printed_rows = 0;
-    size_t start_row    = 0;
-    const Row* header   = NULL;
+    size_t start_row = 0;
+    const Row* header = NULL;
 
     // Print header if present
     if (has_header && row_count > 0) {
@@ -810,7 +807,7 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
 
     // Report filtered row count if filtering was applied
     if ((filter_pattern != NULL && filter_pattern[0] != '\0') || where != NULL) {
-        size_t data_rows       = printed_rows - (has_header ? 1 : 0);
+        size_t data_rows = printed_rows - (has_header ? 1 : 0);
         size_t total_data_rows = row_count - (has_header ? 1 : 0);
 
         if (format == OUTPUT_TABLE || format == OUTPUT_MARKDOWN) {
@@ -827,22 +824,20 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    bool has_header      = true;
-    bool skip_header     = false;
-    bool use_colors      = false;
-    bool use_bgcolor     = false;
-    char comment         = '#';
-    char* delim_arg      = ",";
-    char* hide_cols      = NULL;
+    bool has_header = true;
+    bool skip_header = false;
+    bool use_colors = false;
+    bool use_bgcolor = false;
+    char comment = '#';
+    char* delim_arg = ",";
+    char* hide_cols = NULL;
     char* filter_pattern = NULL;
-    char* where_str      = NULL;
-    char* select_str     = NULL;
-    char* format_str     = NULL;
-    bool sort_desc       = false;
-    char* sort_col       = NULL;
-    size_t max_memory    = 2 << 20;  // 2 MB
+    char* where_str = NULL;
+    char* select_str = NULL;
+    char* format_str = NULL;
+    bool sort_desc = false;
+    char* sort_col = NULL;
 
-    flag_size_t(parser, "memory", 'm', "Maximum memory in bytes to use", &max_memory);
     flag_bool(parser, "header", 'h', "The CSV file has a header", &has_header);
     flag_bool(parser, "skip-header", 's', "Skip the header", &skip_header);
     flag_bool(parser, "color", 'C', "Use text colors for each column", &use_colors);
@@ -914,8 +909,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Initialize the CSV reader
-    CsvReader* reader = csv_reader_new(filename, max_memory);
+    // Initialize the CSV reader with default arena memory.
+    CsvReader* reader = csv_reader_new(filename, 0);
     if (reader == NULL) {
         flag_parser_free(parser);
         return EXIT_FAILURE;
@@ -923,10 +918,10 @@ int main(int argc, char* argv[]) {
 
     // Configure and parse
     CsvReaderConfig config = {
-        .has_header  = has_header,
+        .has_header = has_header,
         .skip_header = skip_header,
-        .comment     = comment,
-        .delim       = delimiter,
+        .comment = comment,
+        .delim = delimiter,
     };
 
     csv_reader_setconfig(reader, config);
@@ -965,13 +960,13 @@ int main(int argc, char* argv[]) {
 
         if (idx >= 0) {
             sort_ctx.col_idx = (size_t)idx;
-            sort_ctx.desc    = sort_desc;
-            sort_ctx.active  = true;
+            sort_ctx.desc = sort_desc;
+            sort_ctx.active = true;
 
             // If we have a header, we must NOT sort row[0].
             // We shift the array pointer by 1 and decrease count by 1.
             size_t sort_start_offset = (has_header) ? 1 : 0;
-            size_t sort_count        = (count > sort_start_offset) ? count - sort_start_offset : 0;
+            size_t sort_count = (count > sort_start_offset) ? count - sort_start_offset : 0;
 
             if (sort_count > 1) {
                 qsort(rows + sort_start_offset, sort_count, sizeof(Row*), compare_rows);
@@ -983,7 +978,7 @@ int main(int argc, char* argv[]) {
 
     // Parse column selection if provided
     ColumnSelection selection = {0};
-    ColumnSelection* sel_ptr  = NULL;
+    ColumnSelection* sel_ptr = NULL;
     if (select_str != NULL) {
         const Row* header = has_header ? rows[0] : NULL;
         if (parse_column_selection(select_str, header, &selection)) {
@@ -992,7 +987,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Parse where clause if provided
-    WhereFilter where      = {0};
+    WhereFilter where = {0};
     WhereFilter* where_ptr = NULL;
 
     if (where_str != NULL) {

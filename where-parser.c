@@ -1,10 +1,9 @@
 #include "where-parser.h"
 #include <ctype.h>
+#include <solidc/cstr.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>  // for strcasecmp
-#include "str.h"      // Assumed to contain trim_string declaration or inline
 
 // Forward declarations for the parser
 static ASTNode* parse_expression(char** stream);
@@ -29,17 +28,17 @@ static WhereClause* parse_single_condition(char* cond_str) {
     if (!cond_str || !*cond_str) return NULL;
 
     const char* operators[] = {">=", "<=", "!=", "contains", ">", "<", "="};
-    CompareOp ops[]         = {OP_GREATER_EQ, OP_LESS_EQ, OP_NOT_EQUALS, OP_CONTAINS, OP_GREATER, OP_LESS, OP_EQUALS};
-    size_t num_ops          = sizeof(operators) / sizeof(operators[0]);
+    CompareOp ops[] = {OP_GREATER_EQ, OP_LESS_EQ, OP_NOT_EQUALS, OP_CONTAINS, OP_GREATER, OP_LESS, OP_EQUALS};
+    size_t num_ops = sizeof(operators) / sizeof(operators[0]);
 
-    char* op_pos       = NULL;
+    char* op_pos = NULL;
     CompareOp found_op = OP_CONTAINS;
 
     // Find operator
     for (size_t i = 0; i < num_ops; i++) {
         char* pos = strcasestr(cond_str, operators[i]);
         if (pos != NULL) {
-            op_pos   = pos;
+            op_pos = pos;
             found_op = ops[i];
             break;
         }
@@ -78,12 +77,12 @@ static WhereClause* parse_single_condition(char* cond_str) {
             break;
     }
 
-    *op_pos        = '\0';  // Split string
+    *op_pos = '\0';  // Split string
     char* col_name = cond_str;
-    char* value    = op_pos + op_len;
+    char* value = op_pos + op_len;
 
     col_name = trim_string(col_name);
-    value    = trim_string(value);
+    value = trim_string(value);
 
     // Value can be empty string in some cases, but col cannot.
     // If value is NULL (from trim failure), that's an error.
@@ -110,7 +109,7 @@ static WhereClause* parse_single_condition(char* cond_str) {
         return NULL;
     }
 
-    wc->op         = found_op;
+    wc->op = found_op;
     wc->column_idx = (size_t)-1;
     wc->is_numeric =
         (found_op == OP_GREATER || found_op == OP_LESS || found_op == OP_GREATER_EQ || found_op == OP_LESS_EQ);
@@ -127,8 +126,7 @@ static inline bool check_token(char** stream, const char* token) {
     if (!stream || !*stream || !token) return false;
 
     char* s = *stream;
-    while (isspace((unsigned char)*s))
-        s++;  // Skip whitespace
+    while (isspace((unsigned char)*s)) s++;  // Skip whitespace
 
     size_t len = strlen(token);
     if (strncasecmp(s, token, len) == 0) {
@@ -150,8 +148,7 @@ static ASTNode* parse_factor(char** stream) {
     if (!stream || !*stream) return NULL;
 
     char* s = *stream;
-    while (isspace((unsigned char)*s))
-        s++;
+    while (isspace((unsigned char)*s)) s++;
     *stream = s;
 
     // Check for Parentheses
@@ -169,7 +166,7 @@ static ASTNode* parse_factor(char** stream) {
     }
 
     // Parse Condition (Read until AND, OR, ), or End)
-    char* start  = *stream;
+    char* start = *stream;
     char* cursor = start;
 
     // Advance cursor until we hit a reserved word or char
@@ -214,7 +211,7 @@ static ASTNode* parse_factor(char** stream) {
         return NULL;
     }
 
-    node->type   = NODE_CONDITION;
+    node->type = NODE_CONDITION;
     node->clause = wc;
     return node;
 }
@@ -243,11 +240,11 @@ static ASTNode* parse_term(char** stream) {
             return NULL;
         }
 
-        parent->type     = NODE_LOGIC;
+        parent->type = NODE_LOGIC;
         parent->logic_op = LOGIC_AND;
-        parent->left     = left;
-        parent->right    = right;
-        left             = parent;
+        parent->left = left;
+        parent->right = right;
+        left = parent;
     }
     return left;
 }
@@ -275,11 +272,11 @@ static ASTNode* parse_expression(char** stream) {
             return NULL;
         }
 
-        parent->type     = NODE_LOGIC;
+        parent->type = NODE_LOGIC;
         parent->logic_op = LOGIC_OR;
-        parent->left     = left;
-        parent->right    = right;
-        left             = parent;
+        parent->left = left;
+        parent->right = right;
+        left = parent;
     }
     return left;
 }
@@ -307,8 +304,7 @@ bool parse_where_clause(const char* where_str, WhereFilter* filter) {
     }
 
     // Check if we consumed the whole string (ignoring trailing spaces)
-    while (isspace((unsigned char)*cursor))
-        cursor++;
+    while (isspace((unsigned char)*cursor)) cursor++;
 
     if (*cursor != '\0') {
         fprintf(stderr, "Error: Unexpected characters at end of where clause: '%s'\n", cursor);
