@@ -8,16 +8,17 @@
 // Author: Dr. Abiira Nathan
 // =================================================================================
 
-#include <ctype.h>             // for isspace
-#include <solidc/csvparser.h>  // CSV parsing functions
-#include <solidc/flags.h>      // Command-line parser
-#include <solidc/arena.h>      // Arena allocator
-#include <solidc/prettytable.h> // Table printer
-#include <stdbool.h>           // for bool
-#include <stdio.h>             // for fprintf, printf, stderr
-#include <stdlib.h>            // for EXIT_FAILURE, EXIT_SUCCESS, malloc, free, calloc
-#include <string.h>            // for strlen, strcasestr, strcmp, strdup
-#include <strings.h>           // for strcasecmp
+#include <ctype.h>               // for isspace
+#include <solidc/arena.h>        // Arena allocator
+#include <solidc/csvparser.h>    // CSV parsing functions
+#include <solidc/flags.h>        // Command-line parser
+#include <solidc/prettytable.h>  // Table printer
+#include <solidc/str_utils.h>    // trim_string
+#include <stdbool.h>             // for bool
+#include <stdio.h>               // for fprintf, printf, stderr
+#include <stdlib.h>              // for EXIT_FAILURE, EXIT_SUCCESS, malloc, free, calloc
+#include <string.h>              // for strlen, strcasestr, strcmp, strdup
+#include <strings.h>             // for strcasecmp
 #include "where-parser.h"
 
 /** Minimum column width for aesthetics. */
@@ -58,6 +59,8 @@ typedef enum {
     OUTPUT_TSV,       // Tab-separated values
     OUTPUT_JSON,      // JSON array of objects
     OUTPUT_MARKDOWN,  // Markdown table
+    OUTPUT_HTML,      // HTML table
+    OUTPUT_EXCEL,     // XML Spreadsheet 2003
 } OutputFormat;
 
 /** Column selection/reordering. */
@@ -355,6 +358,74 @@ static char* trim_and_escape_json(Arena* arena, const char* s) {
     return escaped;
 }
 
+/**
+ * Escapes XML special characters for Excel/HTML output.
+ * @param arena Scratch arena.
+ * @param str Input string.
+ * @return Escaped string.
+ */
+static char* escape_xml(Arena* arena, const char* str) {
+    if (!str) return "";
+
+    size_t len = 0;
+    for (const char* p = str; *p; p++) {
+        switch (*p) {
+            case '<':
+                len += 4;
+                break;  // &lt;
+            case '>':
+                len += 4;
+                break;  // &gt;
+            case '&':
+                len += 5;
+                break;  // &amp;
+            case '"':
+                len += 6;
+                break;  // &quot;
+            case '\'':
+                len += 6;
+                break;  // &apos;
+            default:
+                len++;
+                break;
+        }
+    }
+
+    char* res = arena_alloc(arena, len + 1);
+    if (!res) return "";
+
+    char* dst = res;
+    for (const char* p = str; *p; p++) {
+        switch (*p) {
+            case '<':
+                strcpy(dst, "&lt;");
+                dst += 4;
+                break;
+            case '>':
+                strcpy(dst, "&gt;");
+                dst += 4;
+                break;
+            case '&':
+                strcpy(dst, "&amp;");
+                dst += 5;
+                break;
+            case '"':
+                strcpy(dst, "&quot;");
+                dst += 6;
+                break;
+            case '\'':
+                strcpy(dst, "&apos;");
+                dst += 6;
+                break;
+            default:
+                *dst++ = *p;
+                break;
+        }
+    }
+    *dst = '\0';
+    return res;
+}
+
 // -----------------------------------------------------------------------------
 // PrettyTable Integration
 // -----------------------------------------------------------------------------
@@ -362,9 +433,10 @@ static char* trim_and_escape_json(Arena* arena, const char* s) {
 typedef struct {
     Row** rows;
     size_t* col_mapping;
+    size_t* widths;  // Pre-computed widths for manual padding
     bool use_colors;
-    Arena* arena; // For allocating colored strings
-    const Row* header; // Original header row for get_header
+    Arena* arena;       // For allocating colored strings
+    const Row* header;  // Original header row for get_header
 } TableContext;
 
 /**
@@ -373,16 +445,16 @@ typedef struct {
 static const char* get_header_cb(void* user_data, int col) {
     TableContext* ctx = (TableContext*)user_data;
     if (ctx->header == NULL) return "";
-    
+
     size_t actual_col = ctx->col_mapping[col];
     if (actual_col >= ctx->header->count || ctx->header->fields[actual_col] == NULL) {
         return "";
     }
-    
+
     // Trim string
     char* s = ctx->header->fields[actual_col];
-    while(isspace(*s)) s++;
-    
+    while (isspace(*s)) s++;
+
     return s;
 }
 
@@ -393,31 +465,40 @@ static const char* get_cell_cb(void* user_data, int row, int col) {
     TableContext* ctx = (TableContext*)user_data;
     Row* r = ctx->rows[row];
     size_t actual_col = ctx->col_mapping[col];
-    
+
     const char* val = "";
     if (actual_col < r->count && r->fields[actual_col] != NULL) {
         val = r->fields[actual_col];
     }
-    
+
     // Sanitize control characters (tabs, newlines) for display
     // Prettytable might handle it, but better safe.
     // Also handle coloring here.
-    
+
     if (ctx->use_colors) {
         const char* color = COLUMN_COLORS[(size_t)col % NUM_COLORS];
         const char* reset = COLOR_RESET;
-        
+
         // Sanitize first into a temp buffer (or assume clean for now)
         // We need to calculate length.
         size_t len = strlen(val);
         size_t color_len = strlen(color);
         size_t reset_len = strlen(reset);
-        
-        char* buf = arena_alloc(ctx->arena, len + color_len + reset_len + 1);
+
+        // Calculate padding required
+        // We need to know the target width for this column.
+        // ctx->widths matches the visible columns index (col).
+        size_t target_width = (ctx->widths) ? ctx->widths[col] : len;
+        size_t padding = (target_width > len) ? target_width - len : 0;
+
+        // Allocation size: color + val + padding + reset + null
+        char* buf = arena_alloc(ctx->arena, color_len + len + padding + reset_len + 1);
         if (!buf) return "";
-        
-        strcpy(buf, color);
-        // Copy val but replace control chars
+
+        // 1. Color
+        strncpy(buf, color, color_len + 1);
+
+        // 2. Value (sanitized)
         char* p = buf + color_len;
         for (const char* v = val; *v; v++) {
             if (*v == '\t' || *v == '\n' || *v == '\r') {
@@ -426,11 +507,18 @@ static const char* get_cell_cb(void* user_data, int row, int col) {
                 *p++ = *v;
             }
         }
-        strcpy(p, reset);
+
+        // 3. Padding spaces
+        for (size_t i = 0; i < padding; i++) {
+            *p++ = ' ';
+        }
+
+        // 4. Reset
+        strncpy(p, reset, reset_len + 1);
         return buf;
     }
-    
-    // Non-colored path: still need to sanitize? 
+
+    // Non-colored path: still need to sanitize?
     // prettytable handles raw strings. But newlines break tables.
     // Let's sanitize into arena if special chars found.
     bool dirty = false;
@@ -440,7 +528,7 @@ static const char* get_cell_cb(void* user_data, int row, int col) {
             break;
         }
     }
-    
+
     if (dirty) {
         size_t len = strlen(val);
         char* buf = arena_alloc(ctx->arena, len + 1);
@@ -456,7 +544,7 @@ static const char* get_cell_cb(void* user_data, int row, int col) {
         *p = '\0';
         return buf;
     }
-    
+
     return val;
 }
 
@@ -466,7 +554,7 @@ static const char* get_cell_cb(void* user_data, int row, int col) {
 static int get_length_cb(void* user_data, const char* text) {
     (void)user_data;
     if (!text) return 0;
-    
+
     int len = 0;
     const char* p = text;
     while (*p) {
@@ -489,10 +577,8 @@ static int get_length_cb(void* user_data, const char* text) {
     return len;
 }
 
-
-static void print_row_format(const Row* row, size_t col_count, OutputFormat format,
-                             const ColumnSelection* selection, const Row* header,
-                             bool is_last_row, Arena* scratch) {
+static void print_row_format(const Row* row, size_t col_count, OutputFormat format, const ColumnSelection* selection,
+                             const Row* header, bool is_last_row, Arena* scratch) {
     if (row == NULL) {
         return;
     }
@@ -622,6 +708,61 @@ static void print_row_format(const Row* row, size_t col_count, OutputFormat form
             break;
         }
 
+        case OUTPUT_HTML: {
+            printf("<tr>");
+            for (size_t i = 0; i < col_count; i++) {
+                size_t col = selection != NULL ? selection->indices[i] : i;
+
+                if (selection == NULL && is_column_hidden(col)) {
+                    continue;
+                }
+
+                const char* field = "";
+                if (col < row->count && row->fields[col] != NULL) {
+                    field = row->fields[col];
+                }
+
+                char* escaped = escape_xml(scratch, field);
+                printf("<td>%s</td>", escaped);
+            }
+            printf("</tr>\n");
+            break;
+        }
+
+        case OUTPUT_EXCEL: {
+            printf("   <Row>\n");
+            for (size_t i = 0; i < col_count; i++) {
+                size_t col = selection != NULL ? selection->indices[i] : i;
+
+                if (selection == NULL && is_column_hidden(col)) {
+                    continue;
+                }
+
+                char* field = "";
+                if (col < row->count && row->fields[col] != NULL) {
+                    field = row->fields[col];
+                    // Trim in-place without allocation.
+                    // Note: This modifies the row data, which is safe during final output.
+                    field = trim_string(field);
+                }
+
+                // Check if number
+                char* endptr;
+                strtod(field, &endptr);
+                bool is_num = (*field != '\0' && *endptr == '\0');
+
+                char* escaped = escape_xml(scratch, field);
+
+                if (is_num) {
+                    printf("    <Cell><Data ss:Type=\"Number\">%s</Data></Cell>\n", escaped);
+                } else {
+                    printf("    <Cell><Data ss:Type=\"String\">%s</Data></Cell>\n", escaped);
+                }
+            }
+            printf("   </Row>\n");
+            break;
+        }
+
         default:
             break;
     }
@@ -659,8 +800,8 @@ static void print_markdown_separator(size_t col_count, const ColumnSelection* se
 static void print_table(Row** rows, size_t row_count, bool has_header, OutputFormat format, bool use_colors,
                         bool use_bgcolor, const char* filter_pattern, WhereFilter* where,
                         const ColumnSelection* selection) {
-    (void)use_bgcolor; // Unused since we switched to prettytable
-    
+    (void)use_bgcolor;  // Unused since we switched to prettytable
+
     if (row_count == 0 || rows[0]->count == 0) {
         fprintf(stderr, "Error: No data to print\n");
         return;
@@ -677,7 +818,7 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
     // Pre-calculate visible columns mapping
     // This maps virtual index i (0..N-1) to actual CSV column index.
     // If selection is present, use it. Else skip hidden columns.
-    
+
     // We allocate this in a local arena scope or scratch arena?
     // Let's create a temporary arena for this function's logic
     Arena* print_arena = arena_create(0);
@@ -692,17 +833,17 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
     if (selection != NULL) {
         visible_cols = selection->count;
         col_mapping = ARENA_ALLOC_ARRAY(print_arena, size_t, (size_t)visible_cols);
-        for(int i=0; i<visible_cols; i++) {
+        for (int i = 0; i < visible_cols; i++) {
             col_mapping[i] = selection->indices[i];
         }
     } else {
         // Count visible
-        for(size_t i=0; i<original_col_count; i++) {
+        for (size_t i = 0; i < original_col_count; i++) {
             if (!is_column_hidden(i)) visible_cols++;
         }
         col_mapping = ARENA_ALLOC_ARRAY(print_arena, size_t, (size_t)visible_cols);
         int idx = 0;
-        for(size_t i=0; i<original_col_count; i++) {
+        for (size_t i = 0; i < original_col_count; i++) {
             if (!is_column_hidden(i)) {
                 col_mapping[idx++] = i;
             }
@@ -711,7 +852,7 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
 
     // Filter rows into a list
     size_t start_row = (has_header && row_count > 0) ? 1 : 0;
-    size_t data_row_capacity = row_count; // Upper bound
+    size_t data_row_capacity = row_count;  // Upper bound
     Row** filtered_rows = ARENA_ALLOC_ARRAY(print_arena, Row*, data_row_capacity);
     size_t filtered_count = 0;
 
@@ -727,14 +868,39 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
 
     // Handle Table using PrettyTable
     if (format == OUTPUT_TABLE) {
-        TableContext ctx = {
-            .rows = filtered_rows,
-            .col_mapping = col_mapping,
-            .use_colors = use_colors,
-            .arena = print_arena,
-            .header = (has_header) ? rows[0] : NULL
-        };
-        
+        // Compute column widths first if using colors, so we can manually pad.
+        size_t* widths = NULL;
+        if (use_colors) {
+            widths = ARENA_ALLOC_ARRAY(print_arena, size_t, visible_cols);
+            for (int j = 0; j < visible_cols; j++) {
+                widths[j] = MIN_COLUMN_WIDTH;
+
+                // Check header
+                if (has_header) {
+                    const char* h = get_header_cb(&((TableContext){.header = rows[0], .col_mapping = col_mapping}), j);
+                    size_t h_len = strlen(h);
+                    if (h_len > widths[j]) widths[j] = h_len;
+                }
+
+                // Check rows
+                for (size_t i = 0; i < filtered_count; i++) {
+                    Row* r = filtered_rows[i];
+                    size_t original_col = col_mapping[j];
+                    if (original_col < r->count && r->fields[original_col]) {
+                        size_t len = strlen(r->fields[original_col]);
+                        if (len > widths[j]) widths[j] = len;
+                    }
+                }
+            }
+        }
+
+        TableContext ctx = {.rows = filtered_rows,
+                            .col_mapping = col_mapping,
+                            .widths = widths,
+                            .use_colors = use_colors,
+                            .arena = print_arena,
+                            .header = (has_header) ? rows[0] : NULL};
+
         prettytable_config cfg;
         prettytable_config_init(&cfg);
         cfg.num_rows = filtered_count;
@@ -746,48 +912,101 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
         cfg.show_header = has_header;
         cfg.style = &PRETTYTABLE_STYLE_BOX;
         cfg.show_row_count = true;
-        
         prettytable_print(&cfg);
-
     } else {
-        // Fallback for CSV, TSV, JSON, MARKDOWN (using existing logic but looping over filtered_rows)
-        // Note: filtered_rows contains the pointers to the original rows.
-        
+        // Fallback for CSV, TSV, JSON, MARKDOWN, HTML, EXCEL
         Arena* scratch = arena_create(0);
-        
         if (format == OUTPUT_JSON) {
             printf("[\n");
+        } else if (format == OUTPUT_HTML) {
+            printf("<table>\n");
+            // Print Header
+            if (has_header) {
+                printf("  <thead>\n    <tr>");
+                for (size_t i = 0; i < col_count; i++) {
+                    size_t col = selection != NULL ? selection->indices[i] : i;
+                    if (selection == NULL && is_column_hidden(col)) continue;
+
+                    const char* field = "";
+                    if (col < rows[0]->count && rows[0]->fields[col] != NULL) {
+                        field = rows[0]->fields[col];
+                    }
+                    char* escaped = escape_xml(scratch, field);
+                    printf("<th>%s</th>", escaped);
+                }
+                printf("</tr>\n  </thead>\n  <tbody>\n");
+            } else {
+                printf("  <tbody>\n");
+            }
+        } else if (format == OUTPUT_EXCEL) {
+            // Print XML Spreadsheet 2003 Header
+            printf("<?xml version=\"1.0\"?>\n");
+            printf("<?mso-application progid=\"Excel.Sheet\"?>\n");
+            printf("<Workbook xmlns=\"urn:schemas-microsoft-com:office:spreadsheet\"\n");
+            printf(" xmlns:o=\"urn:schemas-microsoft-com:office:office\"\n");
+            printf(" xmlns:x=\"urn:schemas-microsoft-com:office:excel\"\n");
+            printf(" xmlns:ss=\"urn:schemas-microsoft-com:office:spreadsheet\"\n");
+            printf(" xmlns:html=\"http://www.w3.org/TR/REC-html40\">\n");
+            printf(" <Styles>\n");
+            printf("  <Style ss:ID=\"sHeader\">\n");
+            printf("   <Font ss:Bold=\"1\"/>\n");
+            printf("  </Style>\n");
+            printf(" </Styles>\n");
+            printf(" <Worksheet ss:Name=\"Sheet1\">\n");
+            printf("  <Table>\n");
+
+            // Explicit Header Row
+            if (has_header) {
+                printf("   <Row>\n");
+                for (size_t i = 0; i < col_count; i++) {
+                    size_t col = selection != NULL ? selection->indices[i] : i;
+                    if (selection == NULL && is_column_hidden(col)) continue;
+
+                    const char* field = "";
+                    if (col < rows[0]->count && rows[0]->fields[col] != NULL) {
+                        field = rows[0]->fields[col];
+                    }
+                    char* escaped = escape_xml(scratch, field);
+                    printf("    <Cell ss:StyleID=\"sHeader\"><Data ss:Type=\"String\">%s</Data></Cell>\n", escaped);
+                }
+                printf("   </Row>\n");
+            }
         }
-        
+
         // Print header for Markdown/CSV/TSV if needed
-        if (has_header && format != OUTPUT_JSON) {
-             print_row_format(rows[0], col_count, format, selection, NULL, false, scratch);
-             if (format == OUTPUT_MARKDOWN) {
-                 print_markdown_separator(col_count, selection);
-             }
+        if (has_header && format != OUTPUT_JSON && format != OUTPUT_HTML && format != OUTPUT_EXCEL) {
+            print_row_format(rows[0], col_count, format, selection, NULL, false, scratch);
+            if (format == OUTPUT_MARKDOWN) {
+                print_markdown_separator(col_count, selection);
+            }
         }
-        
+
         for (size_t i = 0; i < filtered_count; i++) {
             bool is_last = (i == filtered_count - 1);
-            // For Markdown/CSV/TSV, we don't need the header row argument in print_row_format usually,
-            // but JSON needs it for keys.
-            print_row_format(filtered_rows[i], col_count, format, selection, has_header ? rows[0] : NULL, is_last, scratch);
+            print_row_format(filtered_rows[i], col_count, format, selection, has_header ? rows[0] : NULL, is_last,
+                             scratch);
             if (scratch) arena_reset(scratch);
         }
-        
+
         if (format == OUTPUT_JSON) {
             printf("]\n");
+        } else if (format == OUTPUT_HTML) {
+            printf("  </tbody>\n</table>\n");
+        } else if (format == OUTPUT_EXCEL) {
+            printf("  </Table>\n");
+            printf(" </Worksheet>\n");
+            printf("</Workbook>\n");
         }
-        
+
         // Report filtered count for Markdown
         if (format == OUTPUT_MARKDOWN && ((filter_pattern != NULL && filter_pattern[0] != '\0') || where != NULL)) {
-             size_t total_data_rows = row_count - (has_header ? 1 : 0);
-             printf("\nFiltered: %zu/%zu rows matched\n", filtered_count, total_data_rows);
+            size_t total_data_rows = row_count - (has_header ? 1 : 0);
+            printf("\nFiltered: %zu/%zu rows matched\n", filtered_count, total_data_rows);
         }
-        
+
         if (scratch) arena_destroy(scratch);
     }
-    
+
     arena_destroy(print_arena);
 }
 
@@ -888,6 +1107,10 @@ int main(int argc, char* argv[]) {
             format = OUTPUT_JSON;
         } else if (strcasecmp(format_str, "markdown") == 0 || strcasecmp(format_str, "md") == 0) {
             format = OUTPUT_MARKDOWN;
+        } else if (strcasecmp(format_str, "html") == 0) {
+            format = OUTPUT_HTML;
+        } else if (strcasecmp(format_str, "excel") == 0 || strcasecmp(format_str, "xls") == 0) {
+            format = OUTPUT_EXCEL;
         } else if (strcasecmp(format_str, "table") != 0) {
             fprintf(stderr, "Warning: Unknown format '%s', using table\n", format_str);
         }
@@ -984,9 +1207,9 @@ int main(int argc, char* argv[]) {
     }
 
     print_table(rows, count, has_header, format, use_colors, use_bgcolor, filter_pattern, where_ptr, sel_ptr);
-    
+
     // No need to free where_filter, arena handles it
-    
+
     csv_reader_free(reader);
     flag_parser_free(parser);
     arena_destroy(arena);
