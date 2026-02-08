@@ -6,6 +6,7 @@
 //
 // Date: 07 December 2025
 // Author: Dr. Abiira Nathan
+// Refactored: February 2026 - Improved modularity and robustness
 // =================================================================================
 
 #include <ctype.h>               // for isspace
@@ -20,6 +21,10 @@
 #include <string.h>              // for strlen, strcasestr, strcmp, strdup
 #include <strings.h>             // for strcasecmp
 #include "where-parser.h"
+
+// =============================================================================
+// CONSTANTS AND CONFIGURATION
+// =============================================================================
 
 /** Minimum column width for aesthetics. */
 #define MIN_COLUMN_WIDTH 3
@@ -52,6 +57,10 @@ static const char* COLUMN_COLORS[] = {
 /** ANSI reset code. */
 #define COLOR_RESET "\033[0m"
 
+// =============================================================================
+// TYPE DEFINITIONS
+// =============================================================================
+
 /** Output format types. */
 typedef enum {
     OUTPUT_TABLE,     // ASCII table (default)
@@ -69,6 +78,38 @@ typedef struct {
     size_t count;                          // Number of selected columns
 } ColumnSelection;
 
+/** Context for the qsort comparison function. */
+typedef struct {
+    size_t col_idx;  // Index of column to sort by
+    bool desc;       // Sort descending?
+    bool active;     // Is sorting active?
+} SortContext;
+
+/** Context for table rendering callbacks. */
+typedef struct {
+    Row** rows;
+    size_t* col_mapping;
+    size_t* widths;  // Pre-computed widths for manual padding when using colors
+    bool use_colors;
+    Arena* arena;       // For allocating colored strings
+    const Row* header;  // Original header row for get_header
+} TableContext;
+
+/** Configuration for printing operations. */
+typedef struct {
+    bool has_header;
+    OutputFormat format;
+    bool use_colors;
+    bool use_bgcolor;
+    const char* filter_pattern;
+    WhereFilter* where;
+    const ColumnSelection* selection;
+} PrintConfig;
+
+// =============================================================================
+// GLOBAL STATE
+// =============================================================================
+
 /**
  * Simple bitset for tracking hidden columns.
  * Much more efficient than dynamic arrays for up to 64 columns.
@@ -76,11 +117,11 @@ typedef struct {
 static unsigned long hidden_columns_mask = 0;
 
 /** Context for the qsort comparison function. */
-static struct {
-    size_t col_idx;  // Index of column to sort by
-    bool desc;       // Sort descending?
-    bool active;     // Is sorting active?
-} sort_ctx = {0, false, false};
+static SortContext sort_ctx = {0, false, false};
+
+// =============================================================================
+// COLUMN VISIBILITY MANAGEMENT
+// =============================================================================
 
 /**
  * Marks a column as hidden.
@@ -100,6 +141,11 @@ static inline void hide_column(size_t index) {
 static inline bool is_column_hidden(size_t index) {
     return index < MAX_HIDDEN_COLUMNS && (hidden_columns_mask & (1UL << index));
 }
+
+/**
+ * Resets the hidden columns mask.
+ */
+static inline void reset_hidden_columns(void) { hidden_columns_mask = 0; }
 
 /**
  * Parses a comma-separated list of column indices and marks them as hidden.
@@ -149,47 +195,14 @@ static int parse_hidden_columns(const char* columns_str) {
     return count;
 }
 
-/**
- * Comparator function for qsort.
- * Tries to compare numerically first; falls back to string comparison.
- */
-static int compare_rows(const void* a, const void* b) {
-    const Row* r1 = *(const Row**)a;
-    const Row* r2 = *(const Row**)b;
-
-    // Handle rows with missing columns safely
-    const char* val1 =
-        (sort_ctx.col_idx < r1->count && r1->fields[sort_ctx.col_idx]) ? r1->fields[sort_ctx.col_idx] : "";
-    const char* val2 =
-        (sort_ctx.col_idx < r2->count && r2->fields[sort_ctx.col_idx]) ? r2->fields[sort_ctx.col_idx] : "";
-
-    int result = 0;
-
-    // Try numeric comparison first
-    char *end1, *end2;
-    double d1 = strtod(val1, &end1);
-    double d2 = strtod(val2, &end2);
-
-    // If both values parsed completely as numbers
-    if (*val1 != '\0' && *val2 != '\0' && *end1 == '\0' && *end2 == '\0') {
-        if (d1 < d2)
-            result = -1;
-        else if (d1 > d2)
-            result = 1;
-        else
-            result = 0;
-    } else {
-        // Fallback to case-insensitive string comparison
-        result = strcasecmp(val1, val2);
-    }
-
-    return sort_ctx.desc ? -result : result;
-}
+// =============================================================================
+// COLUMN LOOKUP AND SELECTION
+// =============================================================================
 
 /**
  * Finds a column index by name in the header row.
  * @param header The header row.
- * @param name Column name to search for (case-sensitive).
+ * @param name Column name to search for (case-insensitive).
  * @return Column index, or -1 if not found.
  */
 ssize_t find_column_by_name(const Row* header, const char* name) {
@@ -282,6 +295,10 @@ static bool parse_column_selection(const char* select_str, const Row* header, Co
     return selection->count > 0;
 }
 
+// =============================================================================
+// ROW FILTERING
+// =============================================================================
+
 /**
  * Checks if a row matches the given filter pattern (case-insensitive substring).
  * @param row The row to check.
@@ -302,6 +319,118 @@ static bool row_matches_filter(const Row* row, const char* pattern) {
 }
 
 /**
+ * Applies all filters to a row.
+ * @param row The row to check.
+ * @param filter_pattern Optional substring filter.
+ * @param where Optional WHERE clause filter.
+ * @return true if the row passes all filters.
+ */
+static bool row_passes_filters(const Row* row, const char* filter_pattern, WhereFilter* where) {
+    if (!row_matches_filter(row, filter_pattern)) {
+        return false;
+    }
+
+    if (where != NULL && !evaluate_where_filter(row, where)) {
+        return false;
+    }
+
+    return true;
+}
+
+// =============================================================================
+// SORTING
+// =============================================================================
+
+/**
+ * Comparator function for qsort.
+ * Tries to compare numerically first; falls back to string comparison.
+ */
+static int compare_rows(const void* a, const void* b) {
+    const Row* r1 = *(const Row**)a;
+    const Row* r2 = *(const Row**)b;
+
+    // Handle rows with missing columns safely
+    const char* val1 =
+        (sort_ctx.col_idx < r1->count && r1->fields[sort_ctx.col_idx]) ? r1->fields[sort_ctx.col_idx] : "";
+    const char* val2 =
+        (sort_ctx.col_idx < r2->count && r2->fields[sort_ctx.col_idx]) ? r2->fields[sort_ctx.col_idx] : "";
+
+    int result = 0;
+
+    // Try numeric comparison first
+    char *end1, *end2;
+    double d1 = strtod(val1, &end1);
+    double d2 = strtod(val2, &end2);
+
+    // If both values parsed completely as numbers
+    if (*val1 != '\0' && *val2 != '\0' && *end1 == '\0' && *end2 == '\0') {
+        if (d1 < d2)
+            result = -1;
+        else if (d1 > d2)
+            result = 1;
+        else
+            result = 0;
+    } else {
+        // Fallback to case-insensitive string comparison
+        result = strcasecmp(val1, val2);
+    }
+
+    return sort_ctx.desc ? -result : result;
+}
+
+/**
+ * Sorts rows by a specified column.
+ * @param rows Array of row pointers.
+ * @param count Total number of rows.
+ * @param has_header Whether the first row is a header.
+ * @param sort_col Column name or index to sort by.
+ * @param sort_desc Sort in descending order?
+ * @return true on success, false if column not found.
+ */
+static bool sort_rows(Row** rows, size_t count, bool has_header, const char* sort_col, bool sort_desc) {
+    if (sort_col == NULL || count == 0) {
+        return false;
+    }
+
+    long idx = -1;
+    char* endptr;
+    long parsed_idx = strtol(sort_col, &endptr, 10);
+
+    // Determine Index
+    if (*endptr == '\0' && parsed_idx >= 0) {
+        idx = parsed_idx;
+    } else if (has_header) {
+        ssize_t found = find_column_by_name(rows[0], sort_col);
+        if (found >= 0) {
+            idx = found;
+        }
+    }
+
+    if (idx < 0) {
+        fprintf(stderr, "Warning: Could not resolve sort column '%s'. Sorting skipped.\n", sort_col);
+        return false;
+    }
+
+    sort_ctx.col_idx = (size_t)idx;
+    sort_ctx.desc = sort_desc;
+    sort_ctx.active = true;
+
+    // If we have a header, we must NOT sort row[0].
+    size_t sort_start_offset = has_header ? 1 : 0;
+    size_t sort_count = (count > sort_start_offset) ? count - sort_start_offset : 0;
+
+    if (sort_count > 1) {
+        qsort(rows + sort_start_offset, sort_count, sizeof(Row*), compare_rows);
+    }
+
+    return true;
+}
+
+// =============================================================================
+// STRING ESCAPING AND SANITIZATION
+// =============================================================================
+
+/**
  * Trims whitespace and escapes a string for JSON output.
  * @param arena Scratch arena for allocation.
  * @param str The string to process.
@@ -315,16 +444,12 @@ static char* trim_and_escape_json(Arena* arena, const char* s) {
     char* str = (char*)s;
     str = trim_string(str);
 
-    // Get length of trimmed string.
     size_t len = strlen(str);
-
-    // Allocate memory (Worst case: every char needs escaping \x -> \\x)
     char* escaped = arena_alloc(arena, len * 2 + 1);
     if (escaped == NULL) {
         return NULL;
     }
 
-    // Escape characters within the trimmed range
     size_t j = 0;
     for (size_t i = 0; i < len; i++) {
         char c = str[i];
@@ -426,18 +551,50 @@ static char* escape_xml(Arena* arena, const char* str) {
     return res;
 }
 
-// -----------------------------------------------------------------------------
-// PrettyTable Integration
-// -----------------------------------------------------------------------------
+/**
+ * Sanitizes control characters in a string for display.
+ * @param arena Arena for allocation.
+ * @param val Input string.
+ * @return Sanitized string.
+ */
+static const char* sanitize_for_display(Arena* arena, const char* val) {
+    if (val == NULL) {
+        return "";
+    }
 
-typedef struct {
-    Row** rows;
-    size_t* col_mapping;
-    size_t* widths;  // Pre-computed widths for manual padding
-    bool use_colors;
-    Arena* arena;       // For allocating colored strings
-    const Row* header;  // Original header row for get_header
-} TableContext;
+    // Check if sanitization is needed
+    bool dirty = false;
+    for (const char* v = val; *v; v++) {
+        if (*v == '\t' || *v == '\n' || *v == '\r') {
+            dirty = true;
+            break;
+        }
+    }
+
+    if (!dirty) {
+        return val;
+    }
+
+    // Sanitize
+    size_t len = strlen(val);
+    char* buf = arena_alloc(arena, len + 1);
+    if (!buf) return "";
+
+    char* p = buf;
+    for (const char* v = val; *v; v++) {
+        if (*v == '\t' || *v == '\n' || *v == '\r') {
+            *p++ = ' ';
+        } else {
+            *p++ = *v;
+        }
+    }
+    *p = '\0';
+    return buf;
+}
+
+// =============================================================================
+// TABLE RENDERING CALLBACKS (for PrettyTable)
+// =============================================================================
 
 /**
  * Callback to get header text for a column.
@@ -459,7 +616,8 @@ static const char* get_header_cb(void* user_data, int col) {
 }
 
 /**
- * Callback to get cell value.
+ * Callback to get cell value with optional coloring.
+ * When colors are used, we manually pad because prettytable needs consistent cell lengths.
  */
 static const char* get_cell_cb(void* user_data, int row, int col) {
     TableContext* ctx = (TableContext*)user_data;
@@ -471,35 +629,30 @@ static const char* get_cell_cb(void* user_data, int row, int col) {
         val = r->fields[actual_col];
     }
 
-    // Sanitize control characters (tabs, newlines) for display
-    // Prettytable might handle it, but better safe.
-    // Also handle coloring here.
-
+    // Sanitize and color if needed
     if (ctx->use_colors) {
         const char* color = COLUMN_COLORS[(size_t)col % NUM_COLORS];
         const char* reset = COLOR_RESET;
 
-        // Sanitize first into a temp buffer (or assume clean for now)
-        // We need to calculate length.
         size_t len = strlen(val);
         size_t color_len = strlen(color);
         size_t reset_len = strlen(reset);
 
         // Calculate padding required
-        // We need to know the target width for this column.
-        // ctx->widths matches the visible columns index (col).
         size_t target_width = (ctx->widths) ? ctx->widths[col] : len;
         size_t padding = (target_width > len) ? target_width - len : 0;
 
-        // Allocation size: color + val + padding + reset + null
+        // Allocate: color + val + padding + reset + null
         char* buf = arena_alloc(ctx->arena, color_len + len + padding + reset_len + 1);
         if (!buf) return "";
 
-        // 1. Color
-        strncpy(buf, color, color_len + 1);
+        char* p = buf;
+
+        // 1. Color code
+        memcpy(p, color, color_len);
+        p += color_len;
 
         // 2. Value (sanitized)
-        char* p = buf + color_len;
         for (const char* v = val; *v; v++) {
             if (*v == '\t' || *v == '\n' || *v == '\r') {
                 *p++ = ' ';
@@ -513,39 +666,16 @@ static const char* get_cell_cb(void* user_data, int row, int col) {
             *p++ = ' ';
         }
 
-        // 4. Reset
-        strncpy(p, reset, reset_len + 1);
-        return buf;
-    }
-
-    // Non-colored path: still need to sanitize?
-    // prettytable handles raw strings. But newlines break tables.
-    // Let's sanitize into arena if special chars found.
-    bool dirty = false;
-    for (const char* v = val; *v; v++) {
-        if (*v == '\t' || *v == '\n' || *v == '\r') {
-            dirty = true;
-            break;
-        }
-    }
-
-    if (dirty) {
-        size_t len = strlen(val);
-        char* buf = arena_alloc(ctx->arena, len + 1);
-        if (!buf) return "";
-        char* p = buf;
-        for (const char* v = val; *v; v++) {
-            if (*v == '\t' || *v == '\n' || *v == '\r') {
-                *p++ = ' ';
-            } else {
-                *p++ = *v;
-            }
-        }
+        // 4. Reset code
+        memcpy(p, reset, reset_len);
+        p += reset_len;
         *p = '\0';
+
         return buf;
     }
 
-    return val;
+    // Non-colored path
+    return sanitize_for_display(ctx->arena, val);
 }
 
 /**
@@ -569,7 +699,6 @@ static int get_length_cb(void* user_data, const char* text) {
                 if (*p == 'm') p++;
             }
         } else {
-            // Handle utf-8? Assuming 1 byte = 1 char for now as per original code
             len++;
             p++;
         }
@@ -577,6 +706,95 @@ static int get_length_cb(void* user_data, const char* text) {
     return len;
 }
 
+// =============================================================================
+// COLUMN MAPPING
+// =============================================================================
+
+/**
+ * Builds a mapping of visible column indices.
+ * @param arena Arena for allocation.
+ * @param original_col_count Total number of columns in the data.
+ * @param selection Optional column selection.
+ * @param col_mapping Output array of visible column indices.
+ * @return Number of visible columns.
+ */
+static int build_column_mapping(Arena* arena, size_t original_col_count, const ColumnSelection* selection,
+                                size_t** col_mapping) {
+    int visible_cols = 0;
+
+    if (selection != NULL) {
+        visible_cols = selection->count;
+        *col_mapping = ARENA_ALLOC_ARRAY(arena, size_t, (size_t)visible_cols);
+        if (*col_mapping == NULL) {
+            return -1;
+        }
+        for (int i = 0; i < visible_cols; i++) {
+            (*col_mapping)[i] = selection->indices[i];
+        }
+    } else {
+        // Count visible columns
+        for (size_t i = 0; i < original_col_count; i++) {
+            if (!is_column_hidden(i)) visible_cols++;
+        }
+
+        *col_mapping = ARENA_ALLOC_ARRAY(arena, size_t, (size_t)visible_cols);
+        if (*col_mapping == NULL) {
+            return -1;
+        }
+
+        int idx = 0;
+        for (size_t i = 0; i < original_col_count; i++) {
+            if (!is_column_hidden(i)) {
+                (*col_mapping)[idx++] = i;
+            }
+        }
+    }
+
+    return visible_cols;
+}
+
+// =============================================================================
+// ROW FILTERING
+// =============================================================================
+
+/**
+ * Filters rows based on pattern and WHERE clause.
+ * @param arena Arena for allocation.
+ * @param rows All rows.
+ * @param row_count Total number of rows.
+ * @param has_header Whether first row is header.
+ * @param filter_pattern Optional substring filter.
+ * @param where Optional WHERE clause.
+ * @param filtered_rows Output array of filtered row pointers.
+ * @return Number of filtered rows.
+ */
+static size_t filter_rows(Arena* arena, Row** rows, size_t row_count, bool has_header, const char* filter_pattern,
+                          WhereFilter* where, Row*** filtered_rows) {
+    size_t start_row = (has_header && row_count > 0) ? 1 : 0;
+    size_t data_row_capacity = row_count;
+
+    *filtered_rows = ARENA_ALLOC_ARRAY(arena, Row*, data_row_capacity);
+    if (*filtered_rows == NULL) {
+        return 0;
+    }
+
+    size_t filtered_count = 0;
+    for (size_t i = start_row; i < row_count; i++) {
+        if (row_passes_filters(rows[i], filter_pattern, where)) {
+            (*filtered_rows)[filtered_count++] = rows[i];
+        }
+    }
+
+    return filtered_count;
+}
+
+// =============================================================================
+// FORMAT-SPECIFIC OUTPUT
+// =============================================================================
+
+/**
+ * Prints a single row in the specified format.
+ */
 static void print_row_format(const Row* row, size_t col_count, OutputFormat format, const ColumnSelection* selection,
                              const Row* header, bool is_last_row, Arena* scratch) {
     if (row == NULL) {
@@ -672,15 +890,11 @@ static void print_row_format(const Row* row, size_t col_count, OutputFormat form
                     field = row->fields[col];
                 }
 
-                // Clean and escape both the Key (header) and the Value (field)
-                // Use scratch arena
                 char* escaped_key = trim_and_escape_json(scratch, field_name);
                 char* escaped_val = trim_and_escape_json(scratch, field);
 
                 printf("\"%s\": \"%s\"", escaped_key != NULL ? escaped_key : "",
                        escaped_val != NULL ? escaped_val : "");
-
-                // No need to free, arena reset handles it
 
                 first_field = false;
             }
@@ -741,8 +955,6 @@ static void print_row_format(const Row* row, size_t col_count, OutputFormat form
                 char* field = "";
                 if (col < row->count && row->fields[col] != NULL) {
                     field = row->fields[col];
-                    // Trim in-place without allocation.
-                    // Note: This modifies the row data, which is safe during final output.
                     field = trim_string(field);
                 }
 
@@ -770,8 +982,6 @@ static void print_row_format(const Row* row, size_t col_count, OutputFormat form
 
 /**
  * Prints markdown table separator after header.
- * @param col_count Number of columns.
- * @param selection Optional column selection (NULL for all columns).
  */
 static void print_markdown_separator(size_t col_count, const ColumnSelection* selection) {
     putchar('|');
@@ -786,141 +996,91 @@ static void print_markdown_separator(size_t col_count, const ColumnSelection* se
     putchar('\n');
 }
 
+// =============================================================================
+// TABLE OUTPUT (using PrettyTable)
+// =============================================================================
+
 /**
- * Pretty-prints the CSV data in the specified format.
- * @param rows Array of Row pointers.
- * @param row_count Number of rows.
- * @param has_header Whether the first row is a header.
- * @param format Output format.
- * @param use_colors Whether to use colors for columns (table format only).
- * @param filter_pattern Pattern to filter rows (can be NULL).
- * @param where Where clause filter (can be NULL).
- * @param selection Optional column selection (NULL for all columns).
+ * Computes column widths for colored output.
+ * This is necessary because when using colors, we manually pad cells.
  */
-static void print_table(Row** rows, size_t row_count, bool has_header, OutputFormat format, bool use_colors,
-                        bool use_bgcolor, const char* filter_pattern, WhereFilter* where,
-                        const ColumnSelection* selection) {
-    (void)use_bgcolor;  // Unused since we switched to prettytable
+static size_t* compute_column_widths(Arena* arena, Row** rows, size_t row_count, const Row* header, size_t* col_mapping,
+                                     int visible_cols) {
+    size_t* widths = ARENA_ALLOC_ARRAY(arena, size_t, visible_cols);
+    if (!widths) return NULL;
 
-    if (row_count == 0 || rows[0]->count == 0) {
-        fprintf(stderr, "Error: No data to print\n");
-        return;
-    }
+    for (int j = 0; j < visible_cols; j++) {
+        widths[j] = MIN_COLUMN_WIDTH;
+        size_t original_col = col_mapping[j];
 
-    size_t original_col_count = rows[0]->count;
-    size_t col_count = selection != NULL ? selection->count : original_col_count;
-
-    // Resolve where clause column indices if present
-    if (where != NULL && has_header) {
-        resolve_ast_indices(where->root, rows[0]);
-    }
-
-    // Pre-calculate visible columns mapping
-    // This maps virtual index i (0..N-1) to actual CSV column index.
-    // If selection is present, use it. Else skip hidden columns.
-
-    // We allocate this in a local arena scope or scratch arena?
-    // Let's create a temporary arena for this function's logic
-    Arena* print_arena = arena_create(0);
-    if (!print_arena) {
-        fprintf(stderr, "Error: Failed to create print arena\n");
-        return;
-    }
-
-    size_t* col_mapping = NULL;
-    int visible_cols = 0;
-
-    if (selection != NULL) {
-        visible_cols = selection->count;
-        col_mapping = ARENA_ALLOC_ARRAY(print_arena, size_t, (size_t)visible_cols);
-        for (int i = 0; i < visible_cols; i++) {
-            col_mapping[i] = selection->indices[i];
+        // Check header
+        if (header != NULL && original_col < header->count && header->fields[original_col]) {
+            size_t h_len = strlen(header->fields[original_col]);
+            if (h_len > widths[j]) widths[j] = h_len;
         }
-    } else {
-        // Count visible
-        for (size_t i = 0; i < original_col_count; i++) {
-            if (!is_column_hidden(i)) visible_cols++;
-        }
-        col_mapping = ARENA_ALLOC_ARRAY(print_arena, size_t, (size_t)visible_cols);
-        int idx = 0;
-        for (size_t i = 0; i < original_col_count; i++) {
-            if (!is_column_hidden(i)) {
-                col_mapping[idx++] = i;
+
+        // Check data rows
+        for (size_t i = 0; i < row_count; i++) {
+            Row* r = rows[i];
+            if (original_col < r->count && r->fields[original_col]) {
+                size_t len = strlen(r->fields[original_col]);
+                if (len > widths[j]) widths[j] = len;
             }
         }
     }
 
-    // Filter rows into a list
-    size_t start_row = (has_header && row_count > 0) ? 1 : 0;
-    size_t data_row_capacity = row_count;  // Upper bound
-    Row** filtered_rows = ARENA_ALLOC_ARRAY(print_arena, Row*, data_row_capacity);
-    size_t filtered_count = 0;
+    return widths;
+}
 
-    for (size_t i = start_row; i < row_count; i++) {
-        bool matches = row_matches_filter(rows[i], filter_pattern);
-        if (matches && where != NULL) {
-            matches = evaluate_where_filter(rows[i], where);
-        }
-        if (matches) {
-            filtered_rows[filtered_count++] = rows[i];
-        }
+/**
+ * Prints data as a pretty table using the prettytable library.
+ */
+static void print_pretty_table(Row** filtered_rows, size_t filtered_count, const Row* header, size_t* col_mapping,
+                               int visible_cols, bool use_colors, Arena* arena) {
+    // Compute widths if using colors (needed for manual padding)
+    size_t* widths = NULL;
+    if (use_colors) {
+        widths = compute_column_widths(arena, filtered_rows, filtered_count, header, col_mapping, visible_cols);
     }
 
-    // Handle Table using PrettyTable
-    if (format == OUTPUT_TABLE) {
-        // Compute column widths first if using colors, so we can manually pad.
-        size_t* widths = NULL;
-        if (use_colors) {
-            widths = ARENA_ALLOC_ARRAY(print_arena, size_t, visible_cols);
-            for (int j = 0; j < visible_cols; j++) {
-                widths[j] = MIN_COLUMN_WIDTH;
+    TableContext ctx = {.rows = filtered_rows,
+                        .col_mapping = col_mapping,
+                        .widths = widths,
+                        .use_colors = use_colors,
+                        .arena = arena,
+                        .header = header};
 
-                // Check header
-                if (has_header) {
-                    const char* h = get_header_cb(&((TableContext){.header = rows[0], .col_mapping = col_mapping}), j);
-                    size_t h_len = strlen(h);
-                    if (h_len > widths[j]) widths[j] = h_len;
-                }
+    prettytable_config cfg;
+    prettytable_config_init(&cfg);
+    cfg.num_rows = filtered_count;
+    cfg.num_cols = visible_cols;
+    cfg.get_header = get_header_cb;
+    cfg.get_cell = get_cell_cb;
+    cfg.get_length = get_length_cb;
+    cfg.user_data = &ctx;
+    cfg.show_header = (header != NULL);
+    cfg.style = &PRETTYTABLE_STYLE_BOX;
+    cfg.show_row_count = true;
 
-                // Check rows
-                for (size_t i = 0; i < filtered_count; i++) {
-                    Row* r = filtered_rows[i];
-                    size_t original_col = col_mapping[j];
-                    if (original_col < r->count && r->fields[original_col]) {
-                        size_t len = strlen(r->fields[original_col]);
-                        if (len > widths[j]) widths[j] = len;
-                    }
-                }
-            }
-        }
+    prettytable_print(&cfg);
+}
 
-        TableContext ctx = {.rows = filtered_rows,
-                            .col_mapping = col_mapping,
-                            .widths = widths,
-                            .use_colors = use_colors,
-                            .arena = print_arena,
-                            .header = (has_header) ? rows[0] : NULL};
+// =============================================================================
+// FORMAT-SPECIFIC HEADERS AND FOOTERS
+// =============================================================================
 
-        prettytable_config cfg;
-        prettytable_config_init(&cfg);
-        cfg.num_rows = filtered_count;
-        cfg.num_cols = visible_cols;
-        cfg.get_header = get_header_cb;
-        cfg.get_cell = get_cell_cb;
-        cfg.get_length = get_length_cb;
-        cfg.user_data = &ctx;
-        cfg.show_header = has_header;
-        cfg.style = &PRETTYTABLE_STYLE_BOX;
-        cfg.show_row_count = true;
-        prettytable_print(&cfg);
-    } else {
-        // Fallback for CSV, TSV, JSON, MARKDOWN, HTML, EXCEL
-        Arena* scratch = arena_create(0);
-        if (format == OUTPUT_JSON) {
+/**
+ * Prints format-specific headers.
+ */
+static void print_format_header(OutputFormat format, bool has_header, Row** rows, size_t col_count,
+                                const ColumnSelection* selection, Arena* scratch) {
+    switch (format) {
+        case OUTPUT_JSON:
             printf("[\n");
-        } else if (format == OUTPUT_HTML) {
+            break;
+
+        case OUTPUT_HTML:
             printf("<table>\n");
-            // Print Header
             if (has_header) {
                 printf("  <thead>\n    <tr>");
                 for (size_t i = 0; i < col_count; i++) {
@@ -938,8 +1098,9 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
             } else {
                 printf("  <tbody>\n");
             }
-        } else if (format == OUTPUT_EXCEL) {
-            // Print XML Spreadsheet 2003 Header
+            break;
+
+        case OUTPUT_EXCEL:
             printf("<?xml version=\"1.0\"?>\n");
             printf("<?mso-application progid=\"Excel.Sheet\"?>\n");
             printf("<Workbook xmlns=\"urn:schemas-microsoft-com:office:spreadsheet\"\n");
@@ -955,7 +1116,6 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
             printf(" <Worksheet ss:Name=\"Sheet1\">\n");
             printf("  <Table>\n");
 
-            // Explicit Header Row
             if (has_header) {
                 printf("   <Row>\n");
                 for (size_t i = 0; i < col_count; i++) {
@@ -971,44 +1131,181 @@ static void print_table(Row** rows, size_t row_count, bool has_header, OutputFor
                 }
                 printf("   </Row>\n");
             }
-        }
+            break;
 
-        // Print header for Markdown/CSV/TSV if needed
-        if (has_header && format != OUTPUT_JSON && format != OUTPUT_HTML && format != OUTPUT_EXCEL) {
-            print_row_format(rows[0], col_count, format, selection, NULL, false, scratch);
-            if (format == OUTPUT_MARKDOWN) {
-                print_markdown_separator(col_count, selection);
-            }
-        }
+        default:
+            // CSV, TSV, Markdown - header printed with data
+            break;
+    }
+}
 
-        for (size_t i = 0; i < filtered_count; i++) {
-            bool is_last = (i == filtered_count - 1);
-            print_row_format(filtered_rows[i], col_count, format, selection, has_header ? rows[0] : NULL, is_last,
-                             scratch);
-            if (scratch) arena_reset(scratch);
-        }
-
-        if (format == OUTPUT_JSON) {
+/**
+ * Prints format-specific footers.
+ */
+static void print_format_footer(OutputFormat format, size_t filtered_count, size_t total_data_rows, bool has_filter) {
+    switch (format) {
+        case OUTPUT_JSON:
             printf("]\n");
-        } else if (format == OUTPUT_HTML) {
+            break;
+
+        case OUTPUT_HTML:
             printf("  </tbody>\n</table>\n");
-        } else if (format == OUTPUT_EXCEL) {
+            break;
+
+        case OUTPUT_EXCEL:
             printf("  </Table>\n");
             printf(" </Worksheet>\n");
             printf("</Workbook>\n");
+            break;
+
+        case OUTPUT_MARKDOWN:
+            if (has_filter) {
+                printf("\nFiltered: %zu/%zu rows matched\n", filtered_count, total_data_rows);
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+// =============================================================================
+// MAIN PRINT FUNCTION
+// =============================================================================
+
+/**
+ * Pretty-prints the CSV data in the specified format.
+ */
+static void print_table(Row** rows, size_t row_count, const PrintConfig* config) {
+    if (row_count == 0 || rows[0]->count == 0) {
+        fprintf(stderr, "Error: No data to print\n");
+        return;
+    }
+
+    size_t original_col_count = rows[0]->count;
+    size_t col_count = config->selection != NULL ? config->selection->count : original_col_count;
+
+    // Resolve where clause column indices if present
+    if (config->where != NULL && config->has_header) {
+        resolve_ast_indices(config->where->root, rows[0]);
+    }
+
+    // Create arena for this operation
+    Arena* print_arena = arena_create(0);
+    if (!print_arena) {
+        fprintf(stderr, "Error: Failed to create print arena\n");
+        return;
+    }
+
+    // Build column mapping
+    size_t* col_mapping = NULL;
+    int visible_cols = build_column_mapping(print_arena, original_col_count, config->selection, &col_mapping);
+    if (visible_cols < 0 || col_mapping == NULL) {
+        fprintf(stderr, "Error: Failed to build column mapping\n");
+        arena_destroy(print_arena);
+        return;
+    }
+
+    // Filter rows
+    Row** filtered_rows = NULL;
+    size_t filtered_count = filter_rows(print_arena, rows, row_count, config->has_header, config->filter_pattern,
+                                        config->where, &filtered_rows);
+
+    // Print based on format
+    if (config->format == OUTPUT_TABLE) {
+        const Row* header = config->has_header ? rows[0] : NULL;
+        print_pretty_table(filtered_rows, filtered_count, header, col_mapping, visible_cols, config->use_colors,
+                           print_arena);
+    } else {
+        // Other formats
+        Arena* scratch = arena_create(0);
+        if (!scratch) {
+            fprintf(stderr, "Error: Failed to create scratch arena\n");
+            arena_destroy(print_arena);
+            return;
         }
 
-        // Report filtered count for Markdown
-        if (format == OUTPUT_MARKDOWN && ((filter_pattern != NULL && filter_pattern[0] != '\0') || where != NULL)) {
-            size_t total_data_rows = row_count - (has_header ? 1 : 0);
-            printf("\nFiltered: %zu/%zu rows matched\n", filtered_count, total_data_rows);
+        // Print header
+        print_format_header(config->format, config->has_header, rows, col_count, config->selection, scratch);
+
+        // Print data header for CSV/TSV/Markdown
+        if (config->has_header && config->format != OUTPUT_JSON && config->format != OUTPUT_HTML &&
+            config->format != OUTPUT_EXCEL) {
+            print_row_format(rows[0], col_count, config->format, config->selection, NULL, false, scratch);
+            if (config->format == OUTPUT_MARKDOWN) {
+                print_markdown_separator(col_count, config->selection);
+            }
         }
 
-        if (scratch) arena_destroy(scratch);
+        // Print data rows
+        for (size_t i = 0; i < filtered_count; i++) {
+            bool is_last = (i == filtered_count - 1);
+            const Row* header = config->has_header ? rows[0] : NULL;
+            print_row_format(filtered_rows[i], col_count, config->format, config->selection, header, is_last, scratch);
+            arena_reset(scratch);
+        }
+
+        // Print footer
+        size_t total_data_rows = row_count - (config->has_header ? 1 : 0);
+        bool has_filter =
+            (config->filter_pattern != NULL && config->filter_pattern[0] != '\0') || (config->where != NULL);
+        print_format_footer(config->format, filtered_count, total_data_rows, has_filter);
+
+        arena_destroy(scratch);
     }
 
     arena_destroy(print_arena);
 }
+
+// =============================================================================
+// COMMAND-LINE PARSING
+// =============================================================================
+
+/**
+ * Parses delimiter string (handles special case of "\t" for tab).
+ */
+static char parse_delimiter(const char* delim_arg) {
+    if (delim_arg == NULL) {
+        return ',';
+    }
+
+    if (strcmp(delim_arg, "\\t") == 0) {
+        return '\t';
+    }
+
+    return delim_arg[0];
+}
+
+/**
+ * Parses output format string.
+ */
+static OutputFormat parse_output_format(const char* format_str) {
+    if (format_str == NULL) {
+        return OUTPUT_TABLE;
+    }
+
+    if (strcasecmp(format_str, "csv") == 0) {
+        return OUTPUT_CSV;
+    } else if (strcasecmp(format_str, "tsv") == 0) {
+        return OUTPUT_TSV;
+    } else if (strcasecmp(format_str, "json") == 0) {
+        return OUTPUT_JSON;
+    } else if (strcasecmp(format_str, "markdown") == 0 || strcasecmp(format_str, "md") == 0) {
+        return OUTPUT_MARKDOWN;
+    } else if (strcasecmp(format_str, "html") == 0) {
+        return OUTPUT_HTML;
+    } else if (strcasecmp(format_str, "excel") == 0 || strcasecmp(format_str, "xls") == 0) {
+        return OUTPUT_EXCEL;
+    } else if (strcasecmp(format_str, "table") != 0) {
+        fprintf(stderr, "Warning: Unknown format '%s', using table\n", format_str);
+    }
+
+    return OUTPUT_TABLE;
+}
+
+// =============================================================================
+// MAIN ENTRY POINT
+// =============================================================================
 
 int main(int argc, char* argv[]) {
     // Create main arena
@@ -1024,6 +1321,7 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
+    // Command-line arguments
     bool has_header = true;
     bool skip_header = false;
     bool use_colors = false;
@@ -1038,6 +1336,7 @@ int main(int argc, char* argv[]) {
     bool sort_desc = false;
     char* sort_col = NULL;
 
+    // Define flags
     flag_bool(parser, "header", 'h', "The CSV file has a header", &has_header);
     flag_bool(parser, "skip-header", 's', "Skip the header", &skip_header);
     flag_bool(parser, "color", 'C', "Use text colors for each column", &use_colors);
@@ -1054,6 +1353,7 @@ int main(int argc, char* argv[]) {
     flag_string(parser, "output", 'o', "Output format: table (default), csv, tsv, json, markdown", &format_str);
     flag_string(parser, "sort", 'B', "Sort by column name or index", &sort_col);
 
+    // Parse flags
     if (flag_parse(parser, argc, argv) != FLAG_OK) {
         flag_parser_free(parser);
         arena_destroy(arena);
@@ -1068,27 +1368,17 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    char delimiter = ',';  // Default is comma (csv)
+    const char* filename = flag_positional_at(parser, 0);
 
-    // Conver char * to char because it painful to pass \t via command-line.
-    if (delim_arg != NULL) {
-        if (strcmp(delim_arg, "\\t") == 0) {
-            delimiter = '\t';
-        } else {
-            // Take the first character (handles literal tabs or custom chars like ';')
-            delimiter = delim_arg[0];
-        }
-    }
+    // Parse configuration
+    char delimiter = parse_delimiter(delim_arg);
+    OutputFormat format = parse_output_format(format_str);
 
-    // If skip-header is requested, the first parsed row is actually data.
-    // We shouldn't treat it as a header for selection or printing logic.
     if (skip_header) {
         has_header = false;
     }
 
-    const char* filename = flag_positional_at(parser, 0);
-
-    // Parse hidden columns into bitset
+    // Parse hidden columns
     if (hide_cols != NULL && parse_hidden_columns(hide_cols) < 0) {
         fprintf(stderr, "Error: Failed to parse hidden columns\n");
         flag_parser_free(parser);
@@ -1096,27 +1386,7 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Parse output format
-    OutputFormat format = OUTPUT_TABLE;
-    if (format_str != NULL) {
-        if (strcasecmp(format_str, "csv") == 0) {
-            format = OUTPUT_CSV;
-        } else if (strcasecmp(format_str, "tsv") == 0) {
-            format = OUTPUT_TSV;
-        } else if (strcasecmp(format_str, "json") == 0) {
-            format = OUTPUT_JSON;
-        } else if (strcasecmp(format_str, "markdown") == 0 || strcasecmp(format_str, "md") == 0) {
-            format = OUTPUT_MARKDOWN;
-        } else if (strcasecmp(format_str, "html") == 0) {
-            format = OUTPUT_HTML;
-        } else if (strcasecmp(format_str, "excel") == 0 || strcasecmp(format_str, "xls") == 0) {
-            format = OUTPUT_EXCEL;
-        } else if (strcasecmp(format_str, "table") != 0) {
-            fprintf(stderr, "Warning: Unknown format '%s', using table\n", format_str);
-        }
-    }
-
-    // Initialize the CSV reader with default arena memory.
+    // Initialize CSV reader
     CsvReader* reader = csv_reader_new(filename, 0);
     if (reader == NULL) {
         flag_parser_free(parser);
@@ -1124,7 +1394,7 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Configure and parse
+    // Configure and parse CSV
     CsvReaderConfig config = {
         .has_header = has_header,
         .skip_header = skip_header,
@@ -1137,7 +1407,7 @@ int main(int argc, char* argv[]) {
     Row** rows = csv_reader_parse(reader);
     if (rows == NULL) {
         fprintf(stderr, "Error: Failed to parse CSV file, likely due to invalid delimiter. ");
-        fprintf(stderr, "Use --delimiter='\\\\t' for Tab-seperated Value file\n");
+        fprintf(stderr, "Use --delimiter='\\\\t' for Tab-separated Value file\n");
         csv_reader_free(reader);
         flag_parser_free(parser);
         arena_destroy(arena);
@@ -1153,40 +1423,12 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Sort data is column is specified.
-    if (sort_col != NULL && count > 0) {
-        long idx = -1;
-        char* endptr;
-        long parsed_idx = strtol(sort_col, &endptr, 10);
-
-        // Determine Index
-        if (*endptr == '\0' && parsed_idx >= 0) {
-            idx = parsed_idx;
-        } else if (has_header) {
-            // Reusing existing find_column_by_name helper
-            ssize_t found = find_column_by_name(rows[0], sort_col);
-            if (found >= 0) idx = found;
-        }
-
-        if (idx >= 0) {
-            sort_ctx.col_idx = (size_t)idx;
-            sort_ctx.desc = sort_desc;
-            sort_ctx.active = true;
-
-            // If we have a header, we must NOT sort row[0].
-            // We shift the array pointer by 1 and decrease count by 1.
-            size_t sort_start_offset = (has_header) ? 1 : 0;
-            size_t sort_count = (count > sort_start_offset) ? count - sort_start_offset : 0;
-
-            if (sort_count > 1) {
-                qsort(rows + sort_start_offset, sort_count, sizeof(Row*), compare_rows);
-            }
-        } else {
-            fprintf(stderr, "Warning: Could not resolve sort column '%s'. Sorting skipped.\n", sort_col);
-        }
+    // Sort if requested
+    if (sort_col != NULL) {
+        sort_rows(rows, count, has_header, sort_col, sort_desc);
     }
 
-    // Parse column selection if provided
+    // Parse column selection
     ColumnSelection selection = {0};
     ColumnSelection* sel_ptr = NULL;
     if (select_str != NULL) {
@@ -1196,22 +1438,31 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Parse where clause if provided
+    // Parse WHERE clause
     WhereFilter where = {0};
     WhereFilter* where_ptr = NULL;
-
     if (where_str != NULL) {
         if (parse_where_clause(arena, where_str, &where)) {
             where_ptr = &where;
         }
     }
 
-    print_table(rows, count, has_header, format, use_colors, use_bgcolor, filter_pattern, where_ptr, sel_ptr);
+    // Prepare print configuration
+    PrintConfig print_config = {.has_header = has_header,
+                                .format = format,
+                                .use_colors = use_colors,
+                                .use_bgcolor = use_bgcolor,
+                                .filter_pattern = filter_pattern,
+                                .where = where_ptr,
+                                .selection = sel_ptr};
 
-    // No need to free where_filter, arena handles it
+    // Print the table
+    print_table(rows, count, &print_config);
 
+    // Cleanup
     csv_reader_free(reader);
     flag_parser_free(parser);
     arena_destroy(arena);
+
     return EXIT_SUCCESS;
 }
