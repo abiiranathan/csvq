@@ -18,6 +18,10 @@
     *   TSV / CSV (Cleaned up)
 *   **Sorting**: Sort by any column (Numeric or String) in Ascending or Descending order.
 *   **Column Management**: Select, reorder, or hide specific columns.
+*   **Pagination**: Use `--offset` and `--limit` to scan large files quickly.
+*   **Quick Analysis Modes**:
+    *   `--count` for filtered row counts
+    *   `--describe` for numeric column stats (count, min, max, mean)
 *   **Fast & Efficient**: Written in C, optimized for speed and low memory usage.
 *   **Robust Parsing**: Handles quoted fields, custom delimiters (including Tabs), and messy data.
 
@@ -57,6 +61,21 @@ Sort data by a specific column index or name.
 csvq employees.csv --sort Salary --desc
 ```
 
+### Pagination for Large Datasets
+```bash
+# Skip first 1,000 matching rows and show next 50
+csvq events.csv --where "status = success" --offset 1000 --limit 50
+```
+
+### Quick Data Analysis
+```bash
+# Count matching rows only
+csvq logs.csv --where "level = error" --count
+
+# Describe numeric columns after filtering
+csvq sales.csv --where "region = East" --describe
+```
+
 ### Converting Formats
 Export data for use in other tools.
 
@@ -92,6 +111,10 @@ csvq data.tsv --delimiter "\t"
 | `--where`     | `-w`  | Filter condition: `col_name > value`                     |
 | `--sort`      | `-B`  | Column to sort by                                        |
 | `--desc`      | `-D`  | Sort descending                                          |
+| `--limit`     | `-l`  | Limit number of rows shown after filtering/sorting       |
+| `--offset`    | `-O`  | Skip N rows after filtering/sorting                      |
+| `--count`     | `-n`  | Print only count of matching rows                        |
+| `--describe`  | `-a`  | Print numeric stats for visible columns                  |
 | `--select`    | `-S`  | Columns to show/reorder (e.g., "id,name")                |
 | `--hide`      | `-H`  | Columns to hide (e.g., "password")                       |
 | `--filter`    | `-f`  | Simple regex-like row search                             |
