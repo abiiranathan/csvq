@@ -1,6 +1,7 @@
 #include "where-parser.h"
 #include <ctype.h>
 #include <solidc/cstr.h>
+#include <solidc/str_utils.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,17 +52,17 @@ static WhereClause* parse_single_condition(Arena* arena, char* cond_str) {
 
     size_t num_ops = sizeof(operators) / sizeof(operators[0]);
 
-    char* op_pos = NULL;
+    char* op_pos       = NULL;
     CompareOp found_op = OP_EQUALS;
-    size_t op_len = 0;
+    size_t op_len      = 0;
 
     // Find operator - now checking longest first
     for (size_t i = 0; i < num_ops; i++) {
         char* pos = strcasestr(cond_str, operators[i]);
         if (pos != NULL) {
-            op_pos = pos;
+            op_pos   = pos;
             found_op = ops[i];
-            op_len = strlen(operators[i]);
+            op_len   = strlen(operators[i]);
             break;  // Safe to break now because we check longest first
         }
     }
@@ -72,12 +73,12 @@ static WhereClause* parse_single_condition(Arena* arena, char* cond_str) {
     }
 
     // Split string at operator
-    *op_pos = '\0';
+    *op_pos        = '\0';
     char* col_name = cond_str;
-    char* value = op_pos + op_len;
+    char* value    = op_pos + op_len;
 
     col_name = trim_string(col_name);
-    value = trim_string(value);
+    value    = trim_string(value);
 
     // Value can be empty string in some cases, but col cannot.
     if (!col_name || !*col_name || !value) {
@@ -104,7 +105,7 @@ static WhereClause* parse_single_condition(Arena* arena, char* cond_str) {
         return NULL;
     }
 
-    wc->op = found_op;
+    wc->op         = found_op;
     wc->column_idx = (size_t)-1;
     wc->is_numeric =
         (found_op == OP_GREATER || found_op == OP_LESS || found_op == OP_GREATER_EQ || found_op == OP_LESS_EQ);
@@ -159,7 +160,7 @@ static ASTNode* parse_factor(Arena* arena, char** stream) {
     }
 
     // Parse Condition (Read until AND, OR, ), or End)
-    char* start = *stream;
+    char* start  = *stream;
     char* cursor = start;
 
     // Advance cursor until we hit a reserved word or char
@@ -197,7 +198,7 @@ static ASTNode* parse_factor(Arena* arena, char** stream) {
         return NULL;
     }
 
-    node->type = NODE_CONDITION;
+    node->type   = NODE_CONDITION;
     node->clause = wc;
     return node;
 }
@@ -223,11 +224,11 @@ static ASTNode* parse_term(Arena* arena, char** stream) {
             return NULL;
         }
 
-        parent->type = NODE_LOGIC;
+        parent->type     = NODE_LOGIC;
         parent->logic_op = LOGIC_AND;
-        parent->left = left;
-        parent->right = right;
-        left = parent;
+        parent->left     = left;
+        parent->right    = right;
+        left             = parent;
     }
     return left;
 }
@@ -252,11 +253,11 @@ static ASTNode* parse_expression(Arena* arena, char** stream) {
             return NULL;
         }
 
-        parent->type = NODE_LOGIC;
+        parent->type     = NODE_LOGIC;
         parent->logic_op = LOGIC_OR;
-        parent->left = left;
-        parent->right = right;
-        left = parent;
+        parent->left     = left;
+        parent->right    = right;
+        left             = parent;
     }
     return left;
 }
