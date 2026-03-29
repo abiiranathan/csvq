@@ -22,7 +22,7 @@
 #include <stdlib.h>              // for EXIT_FAILURE, EXIT_SUCCESS, malloc, free, calloc
 #include <string.h>              // for strlen, strcasestr, strcmp, strdup
 #include <strings.h>             // for strcasecmp
-#include "where-parser.h"
+#include "../include/where-parser.h"
 
 // =============================================================================
 // CONSTANTS AND CONFIGURATION

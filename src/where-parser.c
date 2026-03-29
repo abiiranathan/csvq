@@ -1,4 +1,4 @@
-#include "where-parser.h"
+#include "../include/where-parser.h"
 #include <ctype.h>
 #include <solidc/cstr.h>
 #include <solidc/str_utils.h>

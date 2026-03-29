@@ -39,6 +39,22 @@ cd csvq
 make
 ```
 
+### Project Structure
+
+```text
+csvq/
+├── include/
+│   ├── types.h
+│   └── where-parser.h
+├── src/
+│   ├── csvq.c
+│   └── where-parser.c
+├── LICENSE
+├── Makefile
+├── README.md
+└── test.csv
+```
+
 ## 📖 Usage
 
 ### Basic Table View
