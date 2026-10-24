@@ -5,6 +5,7 @@ TARGET=csvq
 TARGET_WIN=csvq.exe
 TARGET_MAC_INTEL=csvq-macos-x86_64
 TARGET_MAC_ARM=csvq-macos-aarch64
+TEST_SCRIPT=tests/test_csvq.sh
 CFLAGS=-Wall -Werror -Wextra -O3 -static
 CFLAGS_MAC=-Wall -Werror -Wextra -O3
 INCFLAGS=-Iinclude
@@ -28,6 +29,11 @@ $(TARGET): $(SRC)
 debug: $(SRC)
 	$(CC) -g -O0 -Wall -Wextra $(INCFLAGS) -L$(NATIVE_LIB) -I$(NATIVE_INC) -o $(TARGET) $^ $(LDFLAGS)
 
+test: $(TARGET) $(TEST_SCRIPT)
+	CSVQ="$(abspath $(TARGET))" sh $(TEST_SCRIPT)
+
+check: test
+
 windows: $(SRC)
 	zig cc $(CFLAGS) $(INCFLAGS) -target x86_64-windows-gnu -L$(WIN_LIB) -I$(WIN_INC) -o $(TARGET_WIN) $^ $(LDFLAGS)
 
@@ -44,4 +50,4 @@ all: $(TARGET) windows macos
 clean:
 	rm -rf $(TARGET) $(TARGET_WIN) $(TARGET_MAC_INTEL) $(TARGET_MAC_ARM)
 
-.PHONY: clean windows macos-intel macos-arm macos all
+.PHONY: clean windows macos-intel macos-arm macos all test check

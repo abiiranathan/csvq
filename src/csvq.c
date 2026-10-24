@@ -15,7 +15,7 @@
 #include <solidc/csvparser.h>    // CSV parsing functions
 #include <solidc/flags.h>        // Command-line parser
 #include <solidc/prettytable.h>  // Table printer
-#include <solidc/str_utils.h>    // trim_string
+#include <solidc/str.h>          // string utilities
 #include <stdbool.h>             // for bool
 #include <stdint.h>              // for SIZE_MAX
 #include <stdio.h>               // for fprintf, printf, stderr
@@ -36,6 +36,9 @@
 
 /** Maximum number of columns we support selecting/reordering. */
 #define MAX_SELECTED_COLUMNS 64
+
+#define ARENA_ALLOC_ARRAY(arena, type, count) \
+    ((type*)arena_alloc_array_zero(arena, sizeof(type), ARENA_DEFAULT_ALIGN, (count)))
 
 /** ANSI color codes for column coloring. */
 static const char* COLUMN_COLORS[] = {
@@ -146,13 +149,13 @@ static unsigned long hidden_columns_mask = 0;
 static SortContext sort_ctx = {0, false, false};
 
 // Forward declarations for helpers defined later in this file.
-static int build_column_mapping(Arena* arena, size_t original_col_count, const ColumnSelection* selection,
-                                size_t** col_mapping);
-static size_t filter_rows(Arena* arena, Row** rows, size_t row_count, bool has_header, const char* filter_pattern,
-                          WhereFilter* where, Row*** filtered_rows);
+static int build_column_mapping(Arena* arena, size_t original_col_count,
+                                const ColumnSelection* selection, size_t** col_mapping);
+static size_t filter_rows(Arena* arena, Row** rows, size_t row_count, bool has_header,
+                          const char* filter_pattern, WhereFilter* where, Row*** filtered_rows);
 static bool row_passes_filters(const Row* row, const char* filter_pattern, WhereFilter* where);
-static void print_describe_pretty_table(const char** headers, const char** cells, size_t num_rows, size_t num_cols,
-                                        bool use_colors, Arena* arena);
+static void print_describe_pretty_table(const char** headers, const char** cells, size_t num_rows,
+                                        size_t num_cols, bool use_colors, Arena* arena);
 
 // =============================================================================
 // COLUMN VISIBILITY MANAGEMENT
@@ -279,7 +282,8 @@ ssize_t find_column_by_name(const Row* header, const char* name) {
  * @param selection Output ColumnSelection structure.
  * @return true on success, false on error.
  */
-static bool parse_column_selection(const char* select_str, const Row* header, ColumnSelection* selection) {
+static bool parse_column_selection(const char* select_str, const Row* header,
+                                   ColumnSelection* selection) {
     if (select_str == NULL || select_str[0] == '\0' || selection == NULL) {
         return false;
     }
@@ -389,8 +393,8 @@ static bool parse_non_negative_size(const char* value, const char* option_name, 
         return false;
     }
 
-    errno                     = 0;
-    char* endptr              = NULL;
+    errno = 0;
+    char* endptr = NULL;
     unsigned long long parsed = strtoull(value, &endptr, 10);
 
     while (endptr != NULL && isspace((unsigned char)*endptr)) {
@@ -409,9 +413,10 @@ static bool parse_non_negative_size(const char* value, const char* option_name, 
 /**
  * Returns a paginated window over a filtered row set.
  */
-static void compute_row_window(size_t filtered_count, size_t offset, size_t limit, size_t* start, size_t* count) {
+static void compute_row_window(size_t filtered_count, size_t offset, size_t limit, size_t* start,
+                               size_t* count) {
     size_t window_start = (offset < filtered_count) ? offset : filtered_count;
-    size_t remaining    = filtered_count - window_start;
+    size_t remaining = filtered_count - window_start;
     size_t window_count = remaining;
 
     if (limit != SIZE_MAX && limit < window_count) {
@@ -425,10 +430,10 @@ static void compute_row_window(size_t filtered_count, size_t offset, size_t limi
 /**
  * Counts rows that satisfy active filters.
  */
-static size_t count_filtered_rows(Row** rows, size_t row_count, bool has_header, const char* filter_pattern,
-                                  WhereFilter* where) {
+static size_t count_filtered_rows(Row** rows, size_t row_count, bool has_header,
+                                  const char* filter_pattern, WhereFilter* where) {
     size_t start_row = (has_header && row_count > 0) ? 1 : 0;
-    size_t matched   = 0;
+    size_t matched = 0;
 
     for (size_t i = start_row; i < row_count; i++) {
         if (row_passes_filters(rows[i], filter_pattern, where)) {
@@ -442,8 +447,9 @@ static size_t count_filtered_rows(Row** rows, size_t row_count, bool has_header,
 /**
  * Prints numeric descriptive statistics for visible columns.
  */
-static void print_describe_stats(Row** rows, size_t row_count, bool has_header, const char* filter_pattern,
-                                 WhereFilter* where, const ColumnSelection* selection, bool use_colors) {
+static void print_describe_stats(Row** rows, size_t row_count, bool has_header,
+                                 const char* filter_pattern, WhereFilter* where,
+                                 const ColumnSelection* selection, bool use_colors) {
     if (row_count == 0 || rows[0]->count == 0) {
         fprintf(stderr, "Error: No data to describe\n");
         return;
@@ -460,21 +466,24 @@ static void print_describe_stats(Row** rows, size_t row_count, bool has_header, 
     }
 
     size_t* col_mapping = NULL;
-    int visible_cols    = build_column_mapping(arena, rows[0]->count, selection, &col_mapping);
+    int visible_cols = build_column_mapping(arena, rows[0]->count, selection, &col_mapping);
     if (visible_cols < 0 || col_mapping == NULL) {
         fprintf(stderr, "Error: Failed to build column mapping for describe\n");
         arena_destroy(arena);
         return;
     }
 
-    Row** filtered_rows   = NULL;
-    size_t filtered_count = filter_rows(arena, rows, row_count, has_header, filter_pattern, where, &filtered_rows);
+    Row** filtered_rows = NULL;
+    size_t filtered_count =
+        filter_rows(arena, rows, row_count, has_header, filter_pattern, where, &filtered_rows);
 
-    const size_t describe_cols     = 7;
-    const char* describe_headers[] = {"Column", "Numeric", "Missing", "NonNumeric", "Min", "Max", "Mean"};
-    const size_t describe_rows     = (size_t)visible_cols;
+    const size_t describe_cols = 7;
+    const char* describe_headers[] = {"Column", "Numeric", "Missing", "NonNumeric",
+                                      "Min",    "Max",     "Mean"};
+    const size_t describe_rows = (size_t)visible_cols;
 
-    const char** describe_cells = ARENA_ALLOC_ARRAY(arena, const char*, describe_rows* describe_cols);
+    const char** describe_cells =
+        ARENA_ALLOC_ARRAY(arena, const char*, describe_rows* describe_cols);
     if (describe_cells == NULL) {
         fprintf(stderr, "Error: Failed to allocate describe table\n");
         arena_destroy(arena);
@@ -487,15 +496,16 @@ static void print_describe_stats(Row** rows, size_t row_count, bool has_header, 
         ColumnStats stats = {0};
 
         for (size_t r = 0; r < filtered_count; r++) {
-            Row* row          = filtered_rows[r];
-            const char* field = (col < row->count && row->fields[col] != NULL) ? row->fields[col] : NULL;
+            Row* row = filtered_rows[r];
+            const char* field =
+                (col < row->count && row->fields[col] != NULL) ? row->fields[col] : NULL;
 
             if (is_blank_field(field)) {
                 stats.missing_count++;
                 continue;
             }
 
-            errno        = 0;
+            errno = 0;
             char* endptr = NULL;
             double value = strtod(field, &endptr);
 
@@ -505,8 +515,8 @@ static void print_describe_stats(Row** rows, size_t row_count, bool has_header, 
 
             if (endptr != NULL && *endptr == '\0' && errno == 0) {
                 if (!stats.has_numeric) {
-                    stats.min         = value;
-                    stats.max         = value;
+                    stats.min = value;
+                    stats.max = value;
                     stats.has_numeric = true;
                 } else {
                     if (value < stats.min) stats.min = value;
@@ -521,15 +531,21 @@ static void print_describe_stats(Row** rows, size_t row_count, bool has_header, 
         }
 
         char col_name_buf[32] = {0};
-        const char* col_name  = col_name_buf;
+        const char* col_name = col_name_buf;
 
         if (has_header && col < rows[0]->count && rows[0]->fields[col] != NULL) {
             col_name = rows[0]->fields[col];
         } else {
             snprintf(col_name_buf, sizeof(col_name_buf), "col_%zu", col);
+            // Store the generated name in the arena: col_name_buf is reused by
+            // the next iteration and cannot be referenced from describe_cells.
+            col_name = arena_strdup(arena, col_name_buf);
+            if (col_name == NULL) {
+                col_name = "-";
+            }
         }
 
-        size_t base              = ((size_t)i) * describe_cols;
+        size_t base = ((size_t)i) * describe_cols;
         describe_cells[base + 0] = col_name;
 
         char numeric_buf[32];
@@ -563,7 +579,8 @@ static void print_describe_stats(Row** rows, size_t row_count, bool has_header, 
         }
     }
 
-    print_describe_pretty_table(describe_headers, describe_cells, describe_rows, describe_cols, use_colors, arena);
+    print_describe_pretty_table(describe_headers, describe_cells, describe_rows, describe_cols,
+                                use_colors, arena);
 
     fprintf(stderr, "Describe summary computed on %zu filtered rows\n", filtered_count);
     arena_destroy(arena);
@@ -601,10 +618,12 @@ static int compare_rows(const void* a, const void* b) {
     const Row* r2 = *(const Row**)b;
 
     // Handle rows with missing columns safely
-    const char* val1 =
-        (sort_ctx.col_idx < r1->count && r1->fields[sort_ctx.col_idx]) ? r1->fields[sort_ctx.col_idx] : "";
-    const char* val2 =
-        (sort_ctx.col_idx < r2->count && r2->fields[sort_ctx.col_idx]) ? r2->fields[sort_ctx.col_idx] : "";
+    const char* val1 = (sort_ctx.col_idx < r1->count && r1->fields[sort_ctx.col_idx])
+                           ? r1->fields[sort_ctx.col_idx]
+                           : "";
+    const char* val2 = (sort_ctx.col_idx < r2->count && r2->fields[sort_ctx.col_idx])
+                           ? r2->fields[sort_ctx.col_idx]
+                           : "";
 
     int result = 0;
 
@@ -638,7 +657,8 @@ static int compare_rows(const void* a, const void* b) {
  * @param sort_desc Sort in descending order?
  * @return true on success, false if column not found.
  */
-static bool sort_rows(Row** rows, size_t count, bool has_header, const char* sort_col, bool sort_desc) {
+static bool sort_rows(Row** rows, size_t count, bool has_header, const char* sort_col,
+                      bool sort_desc) {
     if (sort_col == NULL || count == 0) {
         return false;
     }
@@ -658,17 +678,18 @@ static bool sort_rows(Row** rows, size_t count, bool has_header, const char* sor
     }
 
     if (idx < 0) {
-        fprintf(stderr, "Warning: Could not resolve sort column '%s'. Sorting skipped.\n", sort_col);
+        fprintf(stderr, "Warning: Could not resolve sort column '%s'. Sorting skipped.\n",
+                sort_col);
         return false;
     }
 
     sort_ctx.col_idx = (size_t)idx;
-    sort_ctx.desc    = sort_desc;
-    sort_ctx.active  = true;
+    sort_ctx.desc = sort_desc;
+    sort_ctx.active = true;
 
     // If we have a header, we must NOT sort row[0].
     size_t sort_start_offset = has_header ? 1 : 0;
-    size_t sort_count        = (count > sort_start_offset) ? count - sort_start_offset : 0;
+    size_t sort_count = (count > sort_start_offset) ? count - sort_start_offset : 0;
 
     if (sort_count > 1) {
         qsort(rows + sort_start_offset, sort_count, sizeof(Row*), compare_rows);
@@ -692,10 +713,15 @@ static char* trim_and_escape_json(Arena* arena, const char* s) {
         return arena_strdup(arena, "");
     }
 
-    char* str = (char*)s;
-    str       = trim_string(str);
+    // Copy before trimming: callers may pass string literals or the same
+    // row field multiple times, and str_trim() writes to the buffer.
+    char* str = arena_strdup(arena, s);
+    if (str == NULL) {
+        return NULL;
+    }
+    str_trim(str);
 
-    size_t len    = strlen(str);
+    size_t len = strlen(str);
     char* escaped = arena_alloc(arena, len * 2 + 1);
     if (escaped == NULL) {
         return NULL;
@@ -828,7 +854,7 @@ static const char* sanitize_for_display(Arena* arena, const char* val) {
 
     // Sanitize
     size_t len = strlen(val);
-    char* buf  = arena_alloc(arena, len + 1);
+    char* buf = arena_alloc(arena, len + 1);
     if (!buf) return "";
 
     char* p = buf;
@@ -872,7 +898,7 @@ static const char* get_header_cb(void* user_data, int col) {
  */
 static const char* get_cell_cb(void* user_data, int row, int col) {
     TableContext* ctx = (TableContext*)user_data;
-    Row* r            = ctx->rows[row];
+    Row* r = ctx->rows[row];
     size_t actual_col = ctx->col_mapping[col];
 
     const char* val = "";
@@ -885,13 +911,13 @@ static const char* get_cell_cb(void* user_data, int row, int col) {
         const char* color = COLUMN_COLORS[(size_t)col % NUM_COLORS];
         const char* reset = COLOR_RESET;
 
-        size_t len       = strlen(val);
+        size_t len = strlen(val);
         size_t color_len = strlen(color);
         size_t reset_len = strlen(reset);
 
         // Calculate padding required
         size_t target_width = (ctx->widths) ? ctx->widths[col] : len;
-        size_t padding      = (target_width > len) ? target_width - len : 0;
+        size_t padding = (target_width > len) ? target_width - len : 0;
 
         // Allocate: color + val + padding + reset + null
         char* buf = arena_alloc(ctx->arena, color_len + len + padding + reset_len + 1);
@@ -936,7 +962,7 @@ static int get_length_cb(void* user_data, const char* text) {
     (void)user_data;
     if (!text) return 0;
 
-    int len       = 0;
+    int len = 0;
     const char* p = text;
     while (*p) {
         if (*p == '\033') {
@@ -975,7 +1001,8 @@ static const char* get_describe_header_cb(void* user_data, int col) {
  */
 static const char* get_describe_cell_cb(void* user_data, int row, int col) {
     DescribeTableContext* ctx = (DescribeTableContext*)user_data;
-    if (ctx == NULL || row < 0 || col < 0 || (size_t)row >= ctx->num_rows || (size_t)col >= ctx->num_cols) {
+    if (ctx == NULL || row < 0 || col < 0 || (size_t)row >= ctx->num_rows ||
+        (size_t)col >= ctx->num_cols) {
         return "";
     }
 
@@ -988,11 +1015,11 @@ static const char* get_describe_cell_cb(void* user_data, int row, int col) {
         const char* color = COLUMN_COLORS[(size_t)col % NUM_COLORS];
         const char* reset = COLOR_RESET;
 
-        size_t len          = strlen(val);
-        size_t color_len    = strlen(color);
-        size_t reset_len    = strlen(reset);
+        size_t len = strlen(val);
+        size_t color_len = strlen(color);
+        size_t reset_len = strlen(reset);
         size_t target_width = (ctx->widths) ? ctx->widths[col] : len;
-        size_t padding      = (target_width > len) ? target_width - len : 0;
+        size_t padding = (target_width > len) ? target_width - len : 0;
 
         char* buf = arena_alloc(ctx->arena, color_len + len + padding + reset_len + 1);
         if (buf == NULL) {
@@ -1028,8 +1055,8 @@ static const char* get_describe_cell_cb(void* user_data, int row, int col) {
 /**
  * Computes column widths for describe-table colored output.
  */
-static size_t* compute_describe_widths(Arena* arena, const char** headers, const char** cells, size_t num_rows,
-                                       size_t num_cols) {
+static size_t* compute_describe_widths(Arena* arena, const char** headers, const char** cells,
+                                       size_t num_rows, size_t num_cols) {
     size_t* widths = ARENA_ALLOC_ARRAY(arena, size_t, num_cols);
     if (widths == NULL) {
         return NULL;
@@ -1037,7 +1064,7 @@ static size_t* compute_describe_widths(Arena* arena, const char** headers, const
 
     for (size_t c = 0; c < num_cols; c++) {
         const char* header = headers[c] != NULL ? headers[c] : "";
-        size_t width       = strlen(header);
+        size_t width = strlen(header);
         if (width < MIN_COLUMN_WIDTH) {
             width = MIN_COLUMN_WIDTH;
         }
@@ -1063,16 +1090,16 @@ static size_t* compute_describe_widths(Arena* arena, const char** headers, const
 /**
  * Renders describe statistics using prettytable.
  */
-static void print_describe_pretty_table(const char** headers, const char** cells, size_t num_rows, size_t num_cols,
-                                        bool use_colors, Arena* arena) {
+static void print_describe_pretty_table(const char** headers, const char** cells, size_t num_rows,
+                                        size_t num_cols, bool use_colors, Arena* arena) {
     DescribeTableContext ctx = {
-        .headers    = headers,
-        .cells      = cells,
-        .widths     = NULL,
-        .num_rows   = num_rows,
-        .num_cols   = num_cols,
+        .headers = headers,
+        .cells = cells,
+        .widths = NULL,
+        .num_rows = num_rows,
+        .num_cols = num_cols,
         .use_colors = use_colors,
-        .arena      = arena,
+        .arena = arena,
     };
 
     if (use_colors) {
@@ -1081,14 +1108,14 @@ static void print_describe_pretty_table(const char** headers, const char** cells
 
     prettytable_config cfg;
     prettytable_config_init(&cfg);
-    cfg.num_rows       = num_rows;
-    cfg.num_cols       = num_cols;
-    cfg.get_header     = get_describe_header_cb;
-    cfg.get_cell       = get_describe_cell_cb;
-    cfg.get_length     = get_length_cb;
-    cfg.user_data      = &ctx;
-    cfg.show_header    = true;
-    cfg.style          = &PRETTYTABLE_STYLE_BOX;
+    cfg.num_rows = num_rows;
+    cfg.num_cols = num_cols;
+    cfg.get_header = get_describe_header_cb;
+    cfg.get_cell = get_describe_cell_cb;
+    cfg.get_length = get_length_cb;
+    cfg.user_data = &ctx;
+    cfg.show_header = true;
+    cfg.style = &PRETTYTABLE_STYLE_BOX;
     cfg.show_row_count = false;
 
     prettytable_print(&cfg);
@@ -1106,8 +1133,8 @@ static void print_describe_pretty_table(const char** headers, const char** cells
  * @param col_mapping Output array of visible column indices.
  * @return Number of visible columns.
  */
-static int build_column_mapping(Arena* arena, size_t original_col_count, const ColumnSelection* selection,
-                                size_t** col_mapping) {
+static int build_column_mapping(Arena* arena, size_t original_col_count,
+                                const ColumnSelection* selection, size_t** col_mapping) {
     int visible_cols = 0;
 
     if (selection != NULL) {
@@ -1156,9 +1183,9 @@ static int build_column_mapping(Arena* arena, size_t original_col_count, const C
  * @param filtered_rows Output array of filtered row pointers.
  * @return Number of filtered rows.
  */
-static size_t filter_rows(Arena* arena, Row** rows, size_t row_count, bool has_header, const char* filter_pattern,
-                          WhereFilter* where, Row*** filtered_rows) {
-    size_t start_row         = (has_header && row_count > 0) ? 1 : 0;
+static size_t filter_rows(Arena* arena, Row** rows, size_t row_count, bool has_header,
+                          const char* filter_pattern, WhereFilter* where, Row*** filtered_rows) {
+    size_t start_row = (has_header && row_count > 0) ? 1 : 0;
     size_t data_row_capacity = row_count;
 
     *filtered_rows = ARENA_ALLOC_ARRAY(arena, Row*, data_row_capacity);
@@ -1183,8 +1210,9 @@ static size_t filter_rows(Arena* arena, Row** rows, size_t row_count, bool has_h
 /**
  * Prints a single row in the specified format.
  */
-static void print_row_format(const Row* row, size_t col_count, OutputFormat format, const ColumnSelection* selection,
-                             const Row* header, bool is_last_row, Arena* scratch) {
+static void print_row_format(const Row* row, size_t col_count, OutputFormat format,
+                             const ColumnSelection* selection, const Row* header, bool is_last_row,
+                             Arena* scratch) {
     if (row == NULL) {
         return;
     }
@@ -1343,7 +1371,7 @@ static void print_row_format(const Row* row, size_t col_count, OutputFormat form
                 char* field = "";
                 if (col < row->count && row->fields[col] != NULL) {
                     field = row->fields[col];
-                    field = trim_string(field);
+                    str_trim(field);
                 }
 
                 // Check if number
@@ -1392,13 +1420,14 @@ static void print_markdown_separator(size_t col_count, const ColumnSelection* se
  * Computes column widths for colored output.
  * This is necessary because when using colors, we manually pad cells.
  */
-static size_t* compute_column_widths(Arena* arena, Row** rows, size_t row_count, const Row* header, size_t* col_mapping,
-                                     int visible_cols) {
-    size_t* widths = ARENA_ALLOC_ARRAY(arena, size_t, visible_cols);
+static size_t* compute_column_widths(Arena* arena, Row** rows, size_t row_count, const Row* header,
+                                     size_t* col_mapping, int visible_cols) {
+    if (visible_cols <= 0) return NULL;
+    size_t* widths = ARENA_ALLOC_ARRAY(arena, size_t, (size_t)visible_cols);
     if (!widths) return NULL;
 
     for (int j = 0; j < visible_cols; j++) {
-        widths[j]           = MIN_COLUMN_WIDTH;
+        widths[j] = MIN_COLUMN_WIDTH;
         size_t original_col = col_mapping[j];
 
         // Check header
@@ -1423,31 +1452,33 @@ static size_t* compute_column_widths(Arena* arena, Row** rows, size_t row_count,
 /**
  * Prints data as a pretty table using the prettytable library.
  */
-static void print_pretty_table(Row** filtered_rows, size_t filtered_count, const Row* header, size_t* col_mapping,
-                               int visible_cols, bool use_colors, Arena* arena) {
+static void print_pretty_table(Row** filtered_rows, size_t filtered_count, const Row* header,
+                               size_t* col_mapping, int visible_cols, bool use_colors,
+                               Arena* arena) {
     // Compute widths if using colors (needed for manual padding)
     size_t* widths = NULL;
     if (use_colors) {
-        widths = compute_column_widths(arena, filtered_rows, filtered_count, header, col_mapping, visible_cols);
+        widths = compute_column_widths(arena, filtered_rows, filtered_count, header, col_mapping,
+                                       visible_cols);
     }
 
-    TableContext ctx = {.rows        = filtered_rows,
+    TableContext ctx = {.rows = filtered_rows,
                         .col_mapping = col_mapping,
-                        .widths      = widths,
-                        .use_colors  = use_colors,
-                        .arena       = arena,
-                        .header      = header};
+                        .widths = widths,
+                        .use_colors = use_colors,
+                        .arena = arena,
+                        .header = header};
 
     prettytable_config cfg;
     prettytable_config_init(&cfg);
-    cfg.num_rows       = filtered_count;
-    cfg.num_cols       = visible_cols;
-    cfg.get_header     = get_header_cb;
-    cfg.get_cell       = get_cell_cb;
-    cfg.get_length     = get_length_cb;
-    cfg.user_data      = &ctx;
-    cfg.show_header    = (header != NULL);
-    cfg.style          = &PRETTYTABLE_STYLE_BOX;
+    cfg.num_rows = filtered_count;
+    cfg.num_cols = visible_cols;
+    cfg.get_header = get_header_cb;
+    cfg.get_cell = get_cell_cb;
+    cfg.get_length = get_length_cb;
+    cfg.user_data = &ctx;
+    cfg.show_header = (header != NULL);
+    cfg.style = &PRETTYTABLE_STYLE_BOX;
     cfg.show_row_count = true;
 
     prettytable_print(&cfg);
@@ -1515,7 +1546,10 @@ static void print_format_header(OutputFormat format, bool has_header, Row** rows
                         field = rows[0]->fields[col];
                     }
                     char* escaped = escape_xml(scratch, field);
-                    printf("    <Cell ss:StyleID=\"sHeader\"><Data ss:Type=\"String\">%s</Data></Cell>\n", escaped);
+                    printf(
+                        "    <Cell ss:StyleID=\"sHeader\"><Data "
+                        "ss:Type=\"String\">%s</Data></Cell>\n",
+                        escaped);
                 }
                 printf("   </Row>\n");
             }
@@ -1530,7 +1564,8 @@ static void print_format_header(OutputFormat format, bool has_header, Row** rows
 /**
  * Prints format-specific footers.
  */
-static void print_format_footer(OutputFormat format, size_t filtered_count, size_t total_data_rows, bool has_filter) {
+static void print_format_footer(OutputFormat format, size_t filtered_count, size_t total_data_rows,
+                                bool has_filter) {
     switch (format) {
         case OUTPUT_JSON:
             printf("]\n");
@@ -1571,7 +1606,7 @@ static void print_table(Row** rows, size_t row_count, const PrintConfig* config)
     }
 
     size_t original_col_count = rows[0]->count;
-    size_t col_count          = config->selection != NULL ? config->selection->count : original_col_count;
+    size_t col_count = config->selection != NULL ? config->selection->count : original_col_count;
 
     // Resolve where clause column indices if present
     if (config->where != NULL && config->has_header) {
@@ -1587,7 +1622,8 @@ static void print_table(Row** rows, size_t row_count, const PrintConfig* config)
 
     // Build column mapping
     size_t* col_mapping = NULL;
-    int visible_cols    = build_column_mapping(print_arena, original_col_count, config->selection, &col_mapping);
+    int visible_cols =
+        build_column_mapping(print_arena, original_col_count, config->selection, &col_mapping);
     if (visible_cols < 0 || col_mapping == NULL) {
         fprintf(stderr, "Error: Failed to build column mapping\n");
         arena_destroy(print_arena);
@@ -1595,9 +1631,9 @@ static void print_table(Row** rows, size_t row_count, const PrintConfig* config)
     }
 
     // Filter rows
-    Row** filtered_rows   = NULL;
-    size_t filtered_count = filter_rows(print_arena, rows, row_count, config->has_header, config->filter_pattern,
-                                        config->where, &filtered_rows);
+    Row** filtered_rows = NULL;
+    size_t filtered_count = filter_rows(print_arena, rows, row_count, config->has_header,
+                                        config->filter_pattern, config->where, &filtered_rows);
 
     size_t window_start = 0;
     size_t window_count = 0;
@@ -1607,8 +1643,8 @@ static void print_table(Row** rows, size_t row_count, const PrintConfig* config)
     // Print based on format
     if (config->format == OUTPUT_TABLE) {
         const Row* header = config->has_header ? rows[0] : NULL;
-        print_pretty_table(window_rows, window_count, header, col_mapping, visible_cols, config->use_colors,
-                           print_arena);
+        print_pretty_table(window_rows, window_count, header, col_mapping, visible_cols,
+                           config->use_colors, print_arena);
     } else {
         // Other formats
         Arena* scratch = arena_create(0);
@@ -1619,12 +1655,14 @@ static void print_table(Row** rows, size_t row_count, const PrintConfig* config)
         }
 
         // Print header
-        print_format_header(config->format, config->has_header, rows, col_count, config->selection, scratch);
+        print_format_header(config->format, config->has_header, rows, col_count, config->selection,
+                            scratch);
 
         // Print data header for CSV/TSV/Markdown
         if (config->has_header && config->format != OUTPUT_JSON && config->format != OUTPUT_HTML &&
             config->format != OUTPUT_EXCEL) {
-            print_row_format(rows[0], col_count, config->format, config->selection, NULL, false, scratch);
+            print_row_format(rows[0], col_count, config->format, config->selection, NULL, false,
+                             scratch);
             if (config->format == OUTPUT_MARKDOWN) {
                 print_markdown_separator(col_count, config->selection);
             }
@@ -1632,16 +1670,17 @@ static void print_table(Row** rows, size_t row_count, const PrintConfig* config)
 
         // Print data rows
         for (size_t i = 0; i < window_count; i++) {
-            bool is_last      = (i == window_count - 1);
+            bool is_last = (i == window_count - 1);
             const Row* header = config->has_header ? rows[0] : NULL;
-            print_row_format(window_rows[i], col_count, config->format, config->selection, header, is_last, scratch);
+            print_row_format(window_rows[i], col_count, config->format, config->selection, header,
+                             is_last, scratch);
             arena_reset(scratch);
         }
 
         // Print footer
         size_t total_data_rows = row_count - (config->has_header ? 1 : 0);
-        bool has_filter =
-            (config->filter_pattern != NULL && config->filter_pattern[0] != '\0') || (config->where != NULL);
+        bool has_filter = (config->filter_pattern != NULL && config->filter_pattern[0] != '\0') ||
+                          (config->where != NULL);
         print_format_footer(config->format, filtered_count, total_data_rows, has_filter);
 
         arena_destroy(scratch);
@@ -1715,25 +1754,25 @@ int main(int argc, char* argv[]) {
     }
 
     // Command-line arguments
-    bool has_header      = true;
-    bool skip_header     = false;
-    bool use_colors      = false;
-    bool use_bgcolor     = false;
-    char comment         = '#';
-    char* delim_arg      = ",";
-    char* hide_cols      = NULL;
+    bool has_header = true;
+    bool skip_header = false;
+    bool use_colors = false;
+    bool use_bgcolor = false;
+    char comment = '#';
+    char* delim_arg = ",";
+    char* hide_cols = NULL;
     char* filter_pattern = NULL;
-    char* where_str      = NULL;
-    char* select_str     = NULL;
-    char* format_str     = NULL;
-    bool sort_desc       = false;
-    char* sort_col       = NULL;
-    bool count_only      = false;
-    bool describe_only   = false;
-    char* limit_str      = NULL;
-    char* offset_str     = NULL;
-    size_t limit         = SIZE_MAX;
-    size_t offset        = 0;
+    char* where_str = NULL;
+    char* select_str = NULL;
+    char* format_str = NULL;
+    bool sort_desc = false;
+    char* sort_col = NULL;
+    bool count_only = false;
+    bool describe_only = false;
+    char* limit_str = NULL;
+    char* offset_str = NULL;
+    size_t limit = SIZE_MAX;
+    size_t offset = 0;
 
     // Define flags
     flag_bool(parser, "header", 'h', "The CSV file has a header", &has_header);
@@ -1742,16 +1781,21 @@ int main(int argc, char* argv[]) {
     flag_bool(parser, "bgcolor", 'G', "Use background color for rows", &use_bgcolor);
     flag_bool(parser, "desc", 'D', "Sort in descending order", &sort_desc);
     flag_bool(parser, "count", 'n', "Print number of rows after filtering", &count_only);
-    flag_bool(parser, "describe", 'a', "Print numeric stats (count/min/max/mean) for visible columns", &describe_only);
+    flag_bool(parser, "describe", 'a',
+              "Print numeric stats (count/min/max/mean) for visible columns", &describe_only);
     flag_char(parser, "comment", 'c', "Comment Character", &comment);
     flag_string(parser, "delimiter", 'd', "The CSV delimiter (use '\\t' for tab)", &delim_arg);
-    flag_string(parser, "hide", 'H', "Comma-separated column indices to hide (e.g., 0,2,5)", &hide_cols);
+    flag_string(parser, "hide", 'H', "Comma-separated column indices to hide (e.g., 0,2,5)",
+                &hide_cols);
     flag_string(parser, "filter", 'f', "Show only rows containing this pattern", &filter_pattern);
     flag_string(parser, "where", 'w',
-                "Filter rows with condition (e.g., 'age > 25', 'name contains John' or 'age > 25 OR status = active')",
+                "Filter rows with condition (e.g., 'age > 25', 'name contains John' or 'age > 25 "
+                "OR status = active')",
                 &where_str);
-    flag_string(parser, "select", 'S', "Select and order columns (e.g., 'name,age' or '0,2,1')", &select_str);
-    flag_string(parser, "output", 'o', "Output format: table (default), csv, tsv, json, markdown", &format_str);
+    flag_string(parser, "select", 'S', "Select and order columns (e.g., 'name,age' or '0,2,1')",
+                &select_str);
+    flag_string(parser, "output", 'o', "Output format: table (default), csv, tsv, json, markdown",
+                &format_str);
     flag_string(parser, "sort", 'B', "Sort by column name or index", &sort_col);
     flag_string(parser, "limit", 'l', "Limit output rows after filtering/sorting", &limit_str);
     flag_string(parser, "offset", 'O', "Skip N rows after filtering/sorting", &offset_str);
@@ -1774,7 +1818,7 @@ int main(int argc, char* argv[]) {
     const char* filename = flag_positional_at(parser, 0);
 
     // Parse configuration
-    char delimiter      = parse_delimiter(delim_arg);
+    char delimiter = parse_delimiter(delim_arg);
     OutputFormat format = parse_output_format(format_str);
 
     if (skip_header) {
@@ -1811,10 +1855,10 @@ int main(int argc, char* argv[]) {
 
     // Configure and parse CSV
     CsvReaderConfig config = {
-        .has_header  = has_header,
+        .has_header = has_header,
         .skip_header = skip_header,
-        .comment     = comment,
-        .delim       = delimiter,
+        .comment = comment,
+        .delim = delimiter,
     };
 
     csv_reader_setconfig(reader, config);
@@ -1845,7 +1889,7 @@ int main(int argc, char* argv[]) {
 
     // Parse column selection
     ColumnSelection selection = {0};
-    ColumnSelection* sel_ptr  = NULL;
+    ColumnSelection* sel_ptr = NULL;
     if (select_str != NULL) {
         const Row* header = has_header ? rows[0] : NULL;
         if (parse_column_selection(select_str, header, &selection)) {
@@ -1854,7 +1898,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Parse WHERE clause
-    WhereFilter where      = {0};
+    WhereFilter where = {0};
     WhereFilter* where_ptr = NULL;
     if (where_str != NULL) {
         if (parse_where_clause(arena, where_str, &where)) {
@@ -1876,7 +1920,8 @@ int main(int argc, char* argv[]) {
     }
 
     if (describe_only) {
-        print_describe_stats(rows, count, has_header, filter_pattern, where_ptr, sel_ptr, use_colors);
+        print_describe_stats(rows, count, has_header, filter_pattern, where_ptr, sel_ptr,
+                             use_colors);
         csv_reader_free(reader);
         flag_parser_free(parser);
         arena_destroy(arena);
@@ -1884,15 +1929,15 @@ int main(int argc, char* argv[]) {
     }
 
     // Prepare print configuration
-    PrintConfig print_config = {.has_header     = has_header,
-                                .format         = format,
-                                .use_colors     = use_colors,
-                                .use_bgcolor    = use_bgcolor,
+    PrintConfig print_config = {.has_header = has_header,
+                                .format = format,
+                                .use_colors = use_colors,
+                                .use_bgcolor = use_bgcolor,
                                 .filter_pattern = filter_pattern,
-                                .where          = where_ptr,
-                                .selection      = sel_ptr,
-                                .limit          = limit,
-                                .offset         = offset};
+                                .where = where_ptr,
+                                .selection = sel_ptr,
+                                .limit = limit,
+                                .offset = offset};
 
     // Print the table
     print_table(rows, count, &print_config);

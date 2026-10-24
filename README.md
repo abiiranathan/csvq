@@ -49,10 +49,21 @@ csvq/
 ├── src/
 │   ├── csvq.c
 │   └── where-parser.c
+├── tests/
+│   └── test_csvq.sh
 ├── LICENSE
 ├── Makefile
 ├── README.md
 └── test.csv
+```
+
+## 🧪 Testing
+
+Run the integration test suite (covers every CLI flag, output format, and filter
+operator):
+
+```bash
+make test
 ```
 
 ## 📖 Usage

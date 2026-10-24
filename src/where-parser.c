@@ -1,7 +1,7 @@
 #include "../include/where-parser.h"
 #include <ctype.h>
 #include <solidc/cstr.h>
-#include <solidc/str_utils.h>
+#include <solidc/str.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,9 +26,10 @@ extern ssize_t find_column_by_name(const Row* header, const char* name);
  * For example, ">=" must be checked before ">" to prevent "age>=25" from matching ">".
  */
 static WhereClause* parse_single_condition(Arena* arena, char* cond_str) {
+    if (!arena || !cond_str || !*cond_str) return NULL;
+
     // Trim input
-    cond_str = trim_string(cond_str);
-    if (!cond_str || !*cond_str) return NULL;
+    str_trim(cond_str);
 
     // Check operators from longest to shortest to avoid partial matches
     // Old order: ">=", "<=", "!=", "contains", ">", "<", "="
@@ -48,21 +49,22 @@ static WhereClause* parse_single_condition(Arena* arena, char* cond_str) {
         "="          // Length 1
     };
 
-    CompareOp ops[] = {OP_CONTAINS, OP_GREATER_EQ, OP_LESS_EQ, OP_NOT_EQUALS, OP_GREATER, OP_LESS, OP_EQUALS};
+    CompareOp ops[] = {OP_CONTAINS, OP_GREATER_EQ, OP_LESS_EQ, OP_NOT_EQUALS,
+                       OP_GREATER,  OP_LESS,       OP_EQUALS};
 
     size_t num_ops = sizeof(operators) / sizeof(operators[0]);
 
-    char* op_pos       = NULL;
+    char* op_pos = NULL;
     CompareOp found_op = OP_EQUALS;
-    size_t op_len      = 0;
+    size_t op_len = 0;
 
     // Find operator - now checking longest first
     for (size_t i = 0; i < num_ops; i++) {
         char* pos = strcasestr(cond_str, operators[i]);
         if (pos != NULL) {
-            op_pos   = pos;
+            op_pos = pos;
             found_op = ops[i];
-            op_len   = strlen(operators[i]);
+            op_len = strlen(operators[i]);
             break;  // Safe to break now because we check longest first
         }
     }
@@ -73,21 +75,21 @@ static WhereClause* parse_single_condition(Arena* arena, char* cond_str) {
     }
 
     // Split string at operator
-    *op_pos        = '\0';
+    *op_pos = '\0';
     char* col_name = cond_str;
-    char* value    = op_pos + op_len;
+    char* value = op_pos + op_len;
 
-    col_name = trim_string(col_name);
-    value    = trim_string(value);
+    str_trim(col_name);
+    str_trim(value);
 
     // Value can be empty string in some cases, but col cannot.
     if (!col_name || !*col_name || !value) {
-        fprintf(stderr, "Error: Invalid condition - column='%s', value='%s'\n", col_name ? col_name : "NULL",
-                value ? value : "NULL");
+        fprintf(stderr, "Error: Invalid condition - column='%s', value='%s'\n",
+                col_name ? col_name : "NULL", value ? value : "NULL");
         return NULL;
     }
 
-    WhereClause* wc = ARENA_ALLOC_ZERO(arena, WhereClause);
+    WhereClause* wc = arena_alloc_zero(arena, sizeof(WhereClause));
     if (!wc) {
         fprintf(stderr, "Error: Memory allocation failed for WhereClause\n");
         return NULL;
@@ -105,10 +107,10 @@ static WhereClause* parse_single_condition(Arena* arena, char* cond_str) {
         return NULL;
     }
 
-    wc->op         = found_op;
+    wc->op = found_op;
     wc->column_idx = (size_t)-1;
-    wc->is_numeric =
-        (found_op == OP_GREATER || found_op == OP_LESS || found_op == OP_GREATER_EQ || found_op == OP_LESS_EQ);
+    wc->is_numeric = (found_op == OP_GREATER || found_op == OP_LESS || found_op == OP_GREATER_EQ ||
+                      found_op == OP_LESS_EQ);
 
     return wc;
 }
@@ -160,7 +162,7 @@ static ASTNode* parse_factor(Arena* arena, char** stream) {
     }
 
     // Parse Condition (Read until AND, OR, ), or End)
-    char* start  = *stream;
+    char* start = *stream;
     char* cursor = start;
 
     // Advance cursor until we hit a reserved word or char
@@ -192,13 +194,13 @@ static ASTNode* parse_factor(Arena* arena, char** stream) {
 
     if (!wc) return NULL;
 
-    ASTNode* node = ARENA_ALLOC_ZERO(arena, ASTNode);
+    ASTNode* node = arena_alloc_zero(arena, sizeof(ASTNode));
     if (!node) {
         fprintf(stderr, "Error: Memory allocation failed for ASTNode\n");
         return NULL;
     }
 
-    node->type   = NODE_CONDITION;
+    node->type = NODE_CONDITION;
     node->clause = wc;
     return node;
 }
@@ -218,17 +220,17 @@ static ASTNode* parse_term(Arena* arena, char** stream) {
             return NULL;
         }
 
-        ASTNode* parent = ARENA_ALLOC_ZERO(arena, ASTNode);
+        ASTNode* parent = arena_alloc_zero(arena, sizeof(ASTNode));
         if (!parent) {
             fprintf(stderr, "Error: Memory allocation failed for AND Logic Node\n");
             return NULL;
         }
 
-        parent->type     = NODE_LOGIC;
+        parent->type = NODE_LOGIC;
         parent->logic_op = LOGIC_AND;
-        parent->left     = left;
-        parent->right    = right;
-        left             = parent;
+        parent->left = left;
+        parent->right = right;
+        left = parent;
     }
     return left;
 }
@@ -247,17 +249,17 @@ static ASTNode* parse_expression(Arena* arena, char** stream) {
             return NULL;
         }
 
-        ASTNode* parent = ARENA_ALLOC_ZERO(arena, ASTNode);
+        ASTNode* parent = arena_alloc_zero(arena, sizeof(ASTNode));
         if (!parent) {
             fprintf(stderr, "Error: Memory allocation failed for OR Logic Node\n");
             return NULL;
         }
 
-        parent->type     = NODE_LOGIC;
+        parent->type = NODE_LOGIC;
         parent->logic_op = LOGIC_OR;
-        parent->left     = left;
-        parent->right    = right;
-        left             = parent;
+        parent->left = left;
+        parent->right = right;
+        left = parent;
     }
     return left;
 }
@@ -334,30 +336,28 @@ static bool evaluate_where_clause(const Row* row, const WhereClause* clause) {
         return false;
     }
 
-    const char* field = row->fields[clause->column_idx];
+    char* field = row->fields[clause->column_idx];
     if (field == NULL) {
         field = "";
     }
+    str_trim(field);
 
-    // Trim the field for comparison (especially important for numeric comparisons)
-    // Note: This creates a temporary copy for safety
-    char* field_trimmed = trim_string((char*)field);
-    if (!field_trimmed) {
-        field_trimmed = (char*)field;
+    if (!field) {
+        field = (char*)field;
     }
 
     switch (clause->op) {
         case OP_CONTAINS:
-            return strcasestr(field_trimmed, clause->value) != NULL;
+            return strcasestr(field, clause->value) != NULL;
 
         case OP_EQUALS: {
             // For equals, trim whitespace from both sides before comparing
-            int result = strcasecmp(field_trimmed, clause->value);
+            int result = strcasecmp(field, clause->value);
             return result == 0;
         }
 
         case OP_NOT_EQUALS: {
-            int result = strcasecmp(field_trimmed, clause->value);
+            int result = strcasecmp(field, clause->value);
             return result != 0;
         }
 
@@ -367,7 +367,7 @@ static bool evaluate_where_clause(const Row* row, const WhereClause* clause) {
         case OP_LESS_EQ: {
             char* field_end;
             char* value_end;
-            double field_num = strtod(field_trimmed, &field_end);
+            double field_num = strtod(field, &field_end);
             double value_num = strtod(clause->value, &value_end);
 
             // Check if both parsed successfully (allowing trailing whitespace)
