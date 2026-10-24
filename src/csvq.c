@@ -14,6 +14,7 @@
 #include <solidc/arena.h>        // Arena allocator
 #include <solidc/csvparser.h>    // CSV parsing functions
 #include <solidc/flags.h>        // Command-line parser
+#include <solidc/map.h>          // Hash map for unique/group-by
 #include <solidc/prettytable.h>  // Table printer
 #include <solidc/str.h>          // string utilities
 #include <stdbool.h>             // for bool
@@ -22,6 +23,9 @@
 #include <stdlib.h>              // for EXIT_FAILURE, EXIT_SUCCESS, malloc, free, calloc
 #include <string.h>              // for strlen, strcasestr, strcmp, strdup
 #include <strings.h>             // for strcasecmp
+#ifndef _WIN32
+#include <unistd.h>  // for close, mkstemp
+#endif
 #include "../include/where-parser.h"
 
 // =============================================================================
@@ -31,11 +35,26 @@
 /** Minimum column width for aesthetics. */
 #define MIN_COLUMN_WIDTH 3
 
+/** Maximum number of sort keys accepted by --sort. */
+#define MAX_SORT_KEYS 8
+
+/** Maximum number of aggregate expressions accepted by --aggregate. */
+#define MAX_AGGREGATES 16
+
+/** Maximum number of columns accepted by --group-by. */
+#define MAX_GROUP_COLUMNS 8
+
 /** Maximum number of columns we support hiding. */
 #define MAX_HIDDEN_COLUMNS 64
 
 /** Maximum number of columns we support selecting/reordering. */
 #define MAX_SELECTED_COLUMNS 64
+
+/** Version reported by --version. */
+#define CSVQ_VERSION "0.2.0"
+
+/** Filename used to request input from standard input. */
+#define STDIN_FILENAME "-"
 
 #define ARENA_ALLOC_ARRAY(arena, type, count) \
     ((type*)arena_alloc_array_zero(arena, sizeof(type), ARENA_DEFAULT_ALIGN, (count)))
@@ -83,12 +102,57 @@ typedef struct {
     size_t count;                          // Number of selected columns
 } ColumnSelection;
 
+/** One sort key: a column plus its direction. */
+typedef struct {
+    size_t col_idx;
+    bool desc;
+} SortKey;
+
 /** Context for the qsort comparison function. */
 typedef struct {
-    size_t col_idx;  // Index of column to sort by
-    bool desc;       // Sort descending?
-    bool active;     // Is sorting active?
+    SortKey keys[MAX_SORT_KEYS];
+    size_t count;
+    bool active;
 } SortContext;
+
+/** Aggregate functions supported by --aggregate. */
+typedef enum {
+    AGG_COUNT,
+    AGG_SUM,
+    AGG_AVG,
+    AGG_MIN,
+    AGG_MAX,
+} AggregateFunc;
+
+/** One parsed aggregate expression, e.g. sum(amount). */
+typedef struct {
+    AggregateFunc func;
+    char* label;        // Display label, e.g. "sum(amount)"
+    char* column_name;  // Column reference (NULL for count)
+    size_t column_idx;  // Resolved column index
+} AggregateSpec;
+
+/** Parsed aggregate expressions. */
+typedef struct {
+    AggregateSpec specs[MAX_AGGREGATES];
+    size_t count;
+} AggregateConfig;
+
+/** Running state for one aggregate expression in one group. */
+typedef struct {
+    size_t numeric_count;
+    double sum;
+    double min;
+    double max;
+    bool has_numeric;
+} AggregateState;
+
+/** One group produced by --group-by. */
+typedef struct {
+    const char** key_values;  // Values of the group columns (arena strings)
+    size_t row_count;
+    AggregateState* states;  // One state per aggregate expression
+} AggregateGroup;
 
 /** Context for table rendering callbacks. */
 typedef struct {
@@ -109,6 +173,8 @@ typedef struct {
     const char* filter_pattern;
     WhereFilter* where;
     const ColumnSelection* selection;
+    bool unique;
+    const char* unique_by;
     size_t limit;
     size_t offset;
 } PrintConfig;
@@ -146,7 +212,7 @@ typedef struct {
 static unsigned long hidden_columns_mask = 0;
 
 /** Context for the qsort comparison function. */
-static SortContext sort_ctx = {0, false, false};
+static SortContext sort_ctx = {.count = 0, .active = false};
 
 // Forward declarations for helpers defined later in this file.
 static int build_column_mapping(Arena* arena, size_t original_col_count,
@@ -156,6 +222,12 @@ static size_t filter_rows(Arena* arena, Row** rows, size_t row_count, bool has_h
 static bool row_passes_filters(const Row* row, const char* filter_pattern, WhereFilter* where);
 static void print_describe_pretty_table(const char** headers, const char** cells, size_t num_rows,
                                         size_t num_cols, bool use_colors, Arena* arena);
+static size_t apply_unique(Arena* arena, Row** rows, size_t row_count, const Row* header,
+                           bool unique_all, const char* unique_by, Row*** out_rows);
+static bool parse_numeric_field(const char* field, double* value);
+static void trimmed_bounds(const char* s, const char** start, size_t* len);
+static char* arena_trimmed_strdup(Arena* arena, const char* s);
+static void print_table(Row** rows, size_t row_count, const PrintConfig* config);
 
 // =============================================================================
 // COLUMN VISIBILITY MANAGEMENT
@@ -276,6 +348,50 @@ ssize_t find_column_by_name(const Row* header, const char* name) {
 }
 
 /**
+ * Resolves a column reference (name or zero-based index) to an index.
+ *
+ * @param arena Arena used for the temporary trimmed name.
+ * @param header Header row, or NULL when only numeric indices are available.
+ * @param ref Column name or numeric index.
+ * @param out Resolved column index.
+ * @return true on success, false if the reference cannot be resolved.
+ */
+static bool resolve_column_ref(Arena* arena, const Row* header, const char* ref, size_t* out) {
+    if (arena == NULL || ref == NULL || out == NULL) {
+        return false;
+    }
+
+    const char* start = NULL;
+    size_t len = 0;
+    trimmed_bounds(ref, &start, &len);
+    if (len == 0) {
+        return false;
+    }
+
+    char* name = arena_strdupn(arena, start, len);
+    if (name == NULL) {
+        return false;
+    }
+
+    char* endptr = NULL;
+    long index = strtol(name, &endptr, 10);
+    if (*name != '\0' && endptr != NULL && *endptr == '\0' && index >= 0) {
+        *out = (size_t)index;
+        return true;
+    }
+
+    if (header != NULL) {
+        ssize_t found = find_column_by_name(header, name);
+        if (found >= 0) {
+            *out = (size_t)found;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
  * Parses a column selection string (e.g., "name,age,email" or "0,2,1").
  * @param select_str The selection string.
  * @param header The header row (needed to resolve names to indices).
@@ -376,6 +492,79 @@ static bool is_blank_field(const char* s) {
 }
 
 /**
+ * Parses a field as a complete floating-point number.
+ * Leading/trailing whitespace is allowed, but trailing non-whitespace is not.
+ *
+ * @param field Field value (may be NULL).
+ * @param value Output value on success.
+ * @return true when the whole field is numeric.
+ */
+static bool parse_numeric_field(const char* field, double* value) {
+    if (field == NULL || value == NULL) {
+        return false;
+    }
+
+    errno = 0;
+    char* endptr = NULL;
+    double parsed = strtod(field, &endptr);
+
+    // Reject blank/whitespace-only fields: strtod performs no conversion and
+    // would otherwise report them as the number zero.
+    if (endptr == field) {
+        return false;
+    }
+
+    while (endptr != NULL && isspace((unsigned char)*endptr)) {
+        endptr++;
+    }
+
+    if (endptr == NULL || *endptr != '\0' || errno != 0) {
+        return false;
+    }
+
+    *value = parsed;
+    return true;
+}
+
+/**
+ * Computes the trimmed bounds of a string without modifying it.
+ *
+ * @param s Input string (may be NULL).
+ * @param start Output pointer to the first non-space character.
+ * @param len Output length after trimming trailing whitespace.
+ */
+static void trimmed_bounds(const char* s, const char** start, size_t* len) {
+    if (s == NULL) {
+        *start = "";
+        *len = 0;
+        return;
+    }
+
+    const char* begin = s;
+    while (isspace((unsigned char)*begin)) {
+        begin++;
+    }
+
+    size_t end = strlen(begin);
+    while (end > 0 && isspace((unsigned char)begin[end - 1])) {
+        end--;
+    }
+
+    *start = begin;
+    *len = end;
+}
+
+/**
+ * Returns a trimmed copy of a field allocated in the arena.
+ */
+static char* arena_trimmed_strdup(Arena* arena, const char* s) {
+    const char* start = NULL;
+    size_t len = 0;
+    trimmed_bounds(s, &start, &len);
+    return arena_strdupn(arena, start, len);
+}
+
+/**
  * Parses a non-negative integer command-line option.
  */
 static bool parse_non_negative_size(const char* value, const char* option_name, size_t* out) {
@@ -428,28 +617,12 @@ static void compute_row_window(size_t filtered_count, size_t offset, size_t limi
 }
 
 /**
- * Counts rows that satisfy active filters.
- */
-static size_t count_filtered_rows(Row** rows, size_t row_count, bool has_header,
-                                  const char* filter_pattern, WhereFilter* where) {
-    size_t start_row = (has_header && row_count > 0) ? 1 : 0;
-    size_t matched = 0;
-
-    for (size_t i = start_row; i < row_count; i++) {
-        if (row_passes_filters(rows[i], filter_pattern, where)) {
-            matched++;
-        }
-    }
-
-    return matched;
-}
-
-/**
  * Prints numeric descriptive statistics for visible columns.
  */
 static void print_describe_stats(Row** rows, size_t row_count, bool has_header,
                                  const char* filter_pattern, WhereFilter* where,
-                                 const ColumnSelection* selection, bool use_colors) {
+                                 const ColumnSelection* selection, bool unique,
+                                 const char* unique_by, bool use_colors) {
     if (row_count == 0 || rows[0]->count == 0) {
         fprintf(stderr, "Error: No data to describe\n");
         return;
@@ -476,6 +649,14 @@ static void print_describe_stats(Row** rows, size_t row_count, bool has_header,
     Row** filtered_rows = NULL;
     size_t filtered_count =
         filter_rows(arena, rows, row_count, has_header, filter_pattern, where, &filtered_rows);
+
+    if (unique || unique_by != NULL) {
+        Row** unique_rows = NULL;
+        const Row* unique_header = has_header ? rows[0] : NULL;
+        filtered_count = apply_unique(arena, filtered_rows, filtered_count, unique_header, unique,
+                                      unique_by, &unique_rows);
+        filtered_rows = unique_rows;
+    }
 
     const size_t describe_cols = 7;
     const char* describe_headers[] = {"Column", "Numeric", "Missing", "NonNumeric",
@@ -505,15 +686,8 @@ static void print_describe_stats(Row** rows, size_t row_count, bool has_header,
                 continue;
             }
 
-            errno = 0;
-            char* endptr = NULL;
-            double value = strtod(field, &endptr);
-
-            while (endptr != NULL && isspace((unsigned char)*endptr)) {
-                endptr++;
-            }
-
-            if (endptr != NULL && *endptr == '\0' && errno == 0) {
+            double value = 0.0;
+            if (parse_numeric_field(field, &value)) {
                 if (!stats.has_numeric) {
                     stats.min = value;
                     stats.max = value;
@@ -611,83 +785,116 @@ static bool row_passes_filters(const Row* row, const char* filter_pattern, Where
 
 /**
  * Comparator function for qsort.
- * Tries to compare numerically first; falls back to string comparison.
+ * Compares each sort key in order, trying numeric comparison first and
+ * falling back to case-insensitive string comparison.
  */
 static int compare_rows(const void* a, const void* b) {
     const Row* r1 = *(const Row**)a;
     const Row* r2 = *(const Row**)b;
 
-    // Handle rows with missing columns safely
-    const char* val1 = (sort_ctx.col_idx < r1->count && r1->fields[sort_ctx.col_idx])
-                           ? r1->fields[sort_ctx.col_idx]
-                           : "";
-    const char* val2 = (sort_ctx.col_idx < r2->count && r2->fields[sort_ctx.col_idx])
-                           ? r2->fields[sort_ctx.col_idx]
-                           : "";
+    for (size_t k = 0; k < sort_ctx.count; k++) {
+        size_t col = sort_ctx.keys[k].col_idx;
 
-    int result = 0;
+        const char* val1 =
+            (col < r1->count && r1->fields[col] != NULL) ? r1->fields[col] : "";
+        const char* val2 =
+            (col < r2->count && r2->fields[col] != NULL) ? r2->fields[col] : "";
 
-    // Try numeric comparison first
-    char *end1, *end2;
-    double d1 = strtod(val1, &end1);
-    double d2 = strtod(val2, &end2);
+        int result = 0;
 
-    // If both values parsed completely as numbers
-    if (*val1 != '\0' && *val2 != '\0' && *end1 == '\0' && *end2 == '\0') {
-        if (d1 < d2)
-            result = -1;
-        else if (d1 > d2)
-            result = 1;
-        else
-            result = 0;
-    } else {
-        // Fallback to case-insensitive string comparison
-        result = strcasecmp(val1, val2);
+        char *end1, *end2;
+        double d1 = strtod(val1, &end1);
+        double d2 = strtod(val2, &end2);
+
+        if (*val1 != '\0' && *val2 != '\0' && *end1 == '\0' && *end2 == '\0') {
+            if (d1 < d2)
+                result = -1;
+            else if (d1 > d2)
+                result = 1;
+        } else {
+            result = strcasecmp(val1, val2);
+        }
+
+        if (result != 0) {
+            return sort_ctx.keys[k].desc ? -result : result;
+        }
     }
 
-    return sort_ctx.desc ? -result : result;
+    return 0;
 }
 
 /**
- * Sorts rows by a specified column.
+ * Sorts rows by one or more comma-separated columns.
+ *
+ * Each key may be prefixed with '-' for descending or '+' for ascending.
+ * Without a prefix, the global --desc setting applies.
+ *
+ * @param arena Arena for temporary column names.
  * @param rows Array of row pointers.
  * @param count Total number of rows.
  * @param has_header Whether the first row is a header.
- * @param sort_col Column name or index to sort by.
- * @param sort_desc Sort in descending order?
- * @return true on success, false if column not found.
+ * @param sort_col Comma-separated column names or indices.
+ * @param sort_desc Default direction for keys without an explicit prefix.
+ * @return true on success, false if no key could be resolved.
  */
-static bool sort_rows(Row** rows, size_t count, bool has_header, const char* sort_col,
+static bool sort_rows(Arena* arena, Row** rows, size_t count, bool has_header, const char* sort_col,
                       bool sort_desc) {
     if (sort_col == NULL || count == 0) {
         return false;
     }
 
-    long idx = -1;
-    char* endptr;
-    long parsed_idx = strtol(sort_col, &endptr, 10);
-
-    // Determine Index
-    if (*endptr == '\0' && parsed_idx >= 0) {
-        idx = parsed_idx;
-    } else if (has_header) {
-        ssize_t found = find_column_by_name(rows[0], sort_col);
-        if (found >= 0) {
-            idx = found;
-        }
-    }
-
-    if (idx < 0) {
-        fprintf(stderr, "Warning: Could not resolve sort column '%s'. Sorting skipped.\n",
-                sort_col);
+    char* copy = strdup(sort_col);
+    if (copy == NULL) {
         return false;
     }
 
-    sort_ctx.col_idx = (size_t)idx;
-    sort_ctx.desc = sort_desc;
+    sort_ctx.count = 0;
+
+    char* saveptr = NULL;
+    char* token = strtok_r(copy, ",", &saveptr);
+    while (token != NULL && sort_ctx.count < MAX_SORT_KEYS) {
+        const char* start = NULL;
+        size_t len = 0;
+        trimmed_bounds(token, &start, &len);
+
+        if (len == 0) {
+            token = strtok_r(NULL, ",", &saveptr);
+            continue;
+        }
+
+        bool desc = sort_desc;
+        if (start[0] == '-') {
+            desc = true;
+            start++;
+            len--;
+        } else if (start[0] == '+') {
+            desc = false;
+            start++;
+            len--;
+        }
+
+        char* ref = arena_strdupn(arena, start, len);
+        size_t col_idx = 0;
+        if (ref != NULL && resolve_column_ref(arena, has_header ? rows[0] : NULL, ref, &col_idx)) {
+            sort_ctx.keys[sort_ctx.count].col_idx = col_idx;
+            sort_ctx.keys[sort_ctx.count].desc = desc;
+            sort_ctx.count++;
+        } else {
+            fprintf(stderr, "Warning: Could not resolve sort column '%s'. Skipping.\n", token);
+        }
+
+        token = strtok_r(NULL, ",", &saveptr);
+    }
+
+    free(copy);
+
+    if (sort_ctx.count == 0) {
+        fprintf(stderr, "Warning: No valid sort columns. Sorting skipped.\n");
+        return false;
+    }
+
     sort_ctx.active = true;
 
-    // If we have a header, we must NOT sort row[0].
     size_t sort_start_offset = has_header ? 1 : 0;
     size_t sort_count = (count > sort_start_offset) ? count - sort_start_offset : 0;
 
@@ -1203,6 +1410,624 @@ static size_t filter_rows(Arena* arena, Row** rows, size_t row_count, bool has_h
     return filtered_count;
 }
 
+/**
+ * Builds a hash-map key for one row from the selected columns.
+ * Column values are trimmed and joined with the ASCII unit separator.
+ */
+static char* build_unique_key(Arena* arena, const Row* row, const size_t* columns,
+                              size_t column_count) {
+    size_t total = 0;
+    for (size_t i = 0; i < column_count; i++) {
+        size_t col = columns[i];
+        const char* field =
+            (col < row->count && row->fields[col] != NULL) ? row->fields[col] : "";
+        const char* start = NULL;
+        size_t len = 0;
+        trimmed_bounds(field, &start, &len);
+        total += len + 1;
+    }
+
+    char* key = arena_alloc_unaligned(arena, total + 1);
+    if (key == NULL) {
+        return NULL;
+    }
+
+    char* p = key;
+    for (size_t i = 0; i < column_count; i++) {
+        size_t col = columns[i];
+        const char* field =
+            (col < row->count && row->fields[col] != NULL) ? row->fields[col] : "";
+        const char* start = NULL;
+        size_t len = 0;
+        trimmed_bounds(field, &start, &len);
+        if (len > 0) {
+            memcpy(p, start, len);
+            p += len;
+        }
+        *p++ = '\x1f';
+    }
+    *p = '\0';
+    return key;
+}
+
+/**
+ * Removes duplicate rows, keeping the first occurrence.
+ *
+ * When @p unique_by is set, rows are compared using only those columns.
+ * Otherwise @p unique_all compares every column. The input order is preserved.
+ *
+ * @param arena Arena for keys and the result array.
+ * @param rows Data rows (no header).
+ * @param row_count Number of data rows.
+ * @param header Header row used to resolve names in @p unique_by (may be NULL).
+ * @param unique_all Deduplicate using every column.
+ * @param unique_by Optional comma-separated column list.
+ * @param out_rows Output array of unique row pointers.
+ * @return Number of rows in the output array.
+ */
+static size_t apply_unique(Arena* arena, Row** rows, size_t row_count, const Row* header,
+                           bool unique_all, const char* unique_by, Row*** out_rows) {
+    if ((!unique_all && unique_by == NULL) || row_count == 0) {
+        *out_rows = rows;
+        return row_count;
+    }
+
+    const size_t* columns = NULL;
+    size_t column_count = 0;
+    ColumnSelection selection = {0};
+
+    if (unique_by != NULL) {
+        if (!parse_column_selection(unique_by, header, &selection)) {
+            fprintf(stderr, "Warning: --unique-by did not resolve any columns; deduplication skipped.\n");
+            *out_rows = rows;
+            return row_count;
+        }
+        columns = selection.indices;
+        column_count = selection.count;
+    } else {
+        size_t total_columns = (header != NULL) ? header->count : rows[0]->count;
+        size_t* all_columns = ARENA_ALLOC_ARRAY(arena, size_t, total_columns);
+        if (all_columns == NULL) {
+            *out_rows = rows;
+            return row_count;
+        }
+        for (size_t i = 0; i < total_columns; i++) {
+            all_columns[i] = i;
+        }
+        columns = all_columns;
+        column_count = total_columns;
+    }
+
+    Row** result = ARENA_ALLOC_ARRAY(arena, Row*, row_count);
+    if (result == NULL) {
+        *out_rows = rows;
+        return row_count;
+    }
+
+    HashMap* seen = map_create(MapConfigStr);
+    if (seen == NULL) {
+        fprintf(stderr, "Warning: Could not allocate deduplication map; deduplication skipped.\n");
+        *out_rows = rows;
+        return row_count;
+    }
+
+    size_t unique_count = 0;
+    for (size_t i = 0; i < row_count; i++) {
+        char* key = build_unique_key(arena, rows[i], columns, column_count);
+        if (key == NULL) {
+            result[unique_count++] = rows[i];
+            continue;
+        }
+
+        size_t key_len = strlen(key) + 1;
+        if (map_get(seen, key, key_len) == NULL) {
+            map_set(seen, key, key_len, rows[i]);
+            result[unique_count++] = rows[i];
+        }
+    }
+
+    map_destroy(seen);
+    *out_rows = result;
+    return unique_count;
+}
+
+// =============================================================================
+// AGGREGATION AND GROUPING
+// =============================================================================
+
+/**
+ * Parses one aggregate expression such as "count", "count(*)", "sum(amount)",
+ * "avg(score)", "min(age)" or "max(age)".
+ *
+ * @param arena Arena for labels and column names.
+ * @param token Expression text.
+ * @param spec Output specification.
+ * @return true on success, false on invalid syntax.
+ */
+static bool parse_aggregate_spec(Arena* arena, const char* token, AggregateSpec* spec) {
+    const char* start = NULL;
+    size_t len = 0;
+    trimmed_bounds(token, &start, &len);
+    if (len == 0 || spec == NULL) {
+        return false;
+    }
+
+    char* label = arena_strdupn(arena, start, len);
+    if (label == NULL) {
+        return false;
+    }
+
+    char* expr = arena_strdup(arena, label);
+    if (expr == NULL) {
+        return false;
+    }
+
+    char* open = strchr(expr, '(');
+    if (open == NULL) {
+        if (strcasecmp(expr, "count") != 0) {
+            return false;
+        }
+        spec->func = AGG_COUNT;
+        spec->label = label;
+        spec->column_name = NULL;
+        spec->column_idx = (size_t)-1;
+        return true;
+    }
+
+    char* close = strrchr(expr, ')');
+    if (close == NULL || close[1] != '\0') {
+        return false;
+    }
+
+    *open = '\0';
+    *close = '\0';
+
+    char* func_name = expr;
+    char* column = open + 1;
+    str_trim(func_name);
+    str_trim(column);
+
+    AggregateFunc func;
+    if (strcasecmp(func_name, "count") == 0) {
+        if (strcmp(column, "*") != 0) {
+            return false;
+        }
+        func = AGG_COUNT;
+        column = NULL;
+    } else if (strcasecmp(func_name, "sum") == 0) {
+        func = AGG_SUM;
+    } else if (strcasecmp(func_name, "avg") == 0) {
+        func = AGG_AVG;
+    } else if (strcasecmp(func_name, "min") == 0) {
+        func = AGG_MIN;
+    } else if (strcasecmp(func_name, "max") == 0) {
+        func = AGG_MAX;
+    } else {
+        return false;
+    }
+
+    if (func != AGG_COUNT && (column == NULL || column[0] == '\0')) {
+        return false;
+    }
+
+    spec->func = func;
+    spec->label = label;
+    spec->column_name = (column != NULL) ? arena_strdup(arena, column) : NULL;
+    spec->column_idx = (size_t)-1;
+    return spec->column_name != NULL || func == AGG_COUNT;
+}
+
+/**
+ * Parses a comma-separated list of aggregate expressions and resolves their
+ * column references against @p header.
+ */
+static bool parse_aggregate_config(Arena* arena, const char* text, const Row* header,
+                                   AggregateConfig* config) {
+    if (text == NULL || config == NULL) {
+        return false;
+    }
+
+    config->count = 0;
+
+    char* copy = strdup(text);
+    if (copy == NULL) {
+        return false;
+    }
+
+    char* saveptr = NULL;
+    char* token = strtok_r(copy, ",", &saveptr);
+    while (token != NULL) {
+        if (config->count >= MAX_AGGREGATES) {
+            fprintf(stderr, "Error: Too many aggregate expressions (maximum %d)\n",
+                    MAX_AGGREGATES);
+            free(copy);
+            return false;
+        }
+
+        AggregateSpec* spec = &config->specs[config->count];
+        if (!parse_aggregate_spec(arena, token, spec)) {
+            fprintf(stderr,
+                    "Error: Invalid aggregate expression '%s'. Use count, count(*), sum(col), "
+                    "avg(col), min(col), or max(col).\n",
+                    token);
+            free(copy);
+            return false;
+        }
+
+        if (spec->column_name != NULL) {
+            if (!resolve_column_ref(arena, header, spec->column_name, &spec->column_idx)) {
+                fprintf(stderr, "Error: Unknown aggregate column '%s'\n", spec->column_name);
+                free(copy);
+                return false;
+            }
+        }
+
+        config->count++;
+        token = strtok_r(NULL, ",", &saveptr);
+    }
+
+    free(copy);
+
+    if (config->count == 0) {
+        fprintf(stderr, "Error: --aggregate needs at least one expression\n");
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * Parses a comma-separated list of group-by columns and resolves them.
+ */
+static bool parse_group_columns(Arena* arena, const char* text, const Row* header, size_t* columns,
+                                size_t* count) {
+    if (text == NULL || columns == NULL || count == NULL) {
+        return false;
+    }
+
+    *count = 0;
+
+    char* copy = strdup(text);
+    if (copy == NULL) {
+        return false;
+    }
+
+    char* saveptr = NULL;
+    char* token = strtok_r(copy, ",", &saveptr);
+    while (token != NULL) {
+        if (*count >= MAX_GROUP_COLUMNS) {
+            fprintf(stderr, "Error: Too many group-by columns (maximum %d)\n",
+                    MAX_GROUP_COLUMNS);
+            free(copy);
+            return false;
+        }
+
+        size_t col = 0;
+        if (!resolve_column_ref(arena, header, token, &col)) {
+            fprintf(stderr, "Error: Unknown group-by column '%s'\n", token);
+            free(copy);
+            return false;
+        }
+
+        columns[(*count)++] = col;
+        token = strtok_r(NULL, ",", &saveptr);
+    }
+
+    free(copy);
+
+    if (*count == 0) {
+        fprintf(stderr, "Error: --group-by needs at least one column\n");
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * Updates one aggregate state with a row.
+ */
+static void update_aggregate_state(AggregateState* state, const Row* row,
+                                   const AggregateSpec* spec) {
+    if (state == NULL || row == NULL || spec == NULL || spec->func == AGG_COUNT) {
+        return;
+    }
+
+    const char* field =
+        (spec->column_idx < row->count && row->fields[spec->column_idx] != NULL)
+            ? row->fields[spec->column_idx]
+            : NULL;
+
+    double value = 0.0;
+    if (!parse_numeric_field(field, &value)) {
+        return;
+    }
+
+    if (!state->has_numeric) {
+        state->min = value;
+        state->max = value;
+        state->has_numeric = true;
+    } else {
+        if (value < state->min) state->min = value;
+        if (value > state->max) state->max = value;
+    }
+
+    state->sum += value;
+    state->numeric_count++;
+}
+
+/**
+ * Formats one aggregate result as an arena string.
+ */
+static char* format_aggregate_value(Arena* arena, const AggregateSpec* spec,
+                                    const AggregateState* state, size_t row_count) {
+    char buf[64];
+
+    if (spec->func == AGG_COUNT) {
+        snprintf(buf, sizeof(buf), "%zu", row_count);
+        return arena_strdup(arena, buf);
+    }
+
+    if (state == NULL || !state->has_numeric || state->numeric_count == 0) {
+        return arena_strdup(arena, "-");
+    }
+
+    double value = 0.0;
+    switch (spec->func) {
+        case AGG_SUM:
+            value = state->sum;
+            break;
+        case AGG_AVG:
+            value = state->sum / (double)state->numeric_count;
+            break;
+        case AGG_MIN:
+            value = state->min;
+            break;
+        case AGG_MAX:
+            value = state->max;
+            break;
+        case AGG_COUNT:
+            value = 0.0;
+            break;
+    }
+
+    snprintf(buf, sizeof(buf), "%.6g", value);
+    return arena_strdup(arena, buf);
+}
+
+/**
+ * Builds a synthetic Row from a list of string fields.
+ */
+static Row* make_synthetic_row(Arena* arena, const char** fields, size_t count) {
+    Row* row = arena_alloc_zero(arena, sizeof(Row));
+    if (row == NULL) {
+        return NULL;
+    }
+
+    row->count = count;
+    row->fields = ARENA_ALLOC_ARRAY(arena, char*, count);
+    if (row->fields == NULL) {
+        return NULL;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        row->fields[i] = (char*)fields[i];
+    }
+    return row;
+}
+
+/**
+ * Aggregates filtered rows (optionally grouped) and renders the result using
+ * the normal output pipeline, so every output format and color setting works.
+ */
+static bool print_aggregate_stats(Row** rows, size_t row_count, bool has_header,
+                                  const char* filter_pattern, WhereFilter* where, bool unique,
+                                  const char* unique_by, const char* group_by_str,
+                                  const char* aggregate_str, OutputFormat format, bool use_colors,
+                                  size_t limit, size_t offset) {
+    if (row_count == 0 || rows[0]->count == 0) {
+        fprintf(stderr, "Error: No data to aggregate\n");
+        return false;
+    }
+
+    Arena* arena = arena_create(0);
+    if (arena == NULL) {
+        fprintf(stderr, "Error: Failed to create aggregation arena\n");
+        return false;
+    }
+
+    const Row* header = has_header ? rows[0] : NULL;
+
+    if (where != NULL && has_header) {
+        resolve_ast_indices(where->root, rows[0]);
+    }
+
+    size_t group_columns[MAX_GROUP_COLUMNS] = {0};
+    size_t group_column_count = 0;
+    if (group_by_str != NULL &&
+        !parse_group_columns(arena, group_by_str, header, group_columns, &group_column_count)) {
+        arena_destroy(arena);
+        return false;
+    }
+
+    AggregateConfig aggregates = {0};
+    if (aggregate_str != NULL) {
+        if (!parse_aggregate_config(arena, aggregate_str, header, &aggregates)) {
+            arena_destroy(arena);
+            return false;
+        }
+    } else if (group_column_count > 0) {
+        // Grouping without an explicit aggregate defaults to counting rows.
+        aggregates.count = 1;
+        aggregates.specs[0].func = AGG_COUNT;
+        aggregates.specs[0].label = "count";
+        aggregates.specs[0].column_name = NULL;
+        aggregates.specs[0].column_idx = (size_t)-1;
+    } else {
+        fprintf(stderr, "Error: --aggregate or --group-by is required\n");
+        arena_destroy(arena);
+        return false;
+    }
+
+    Row** filtered_rows = NULL;
+    size_t filtered_count =
+        filter_rows(arena, rows, row_count, has_header, filter_pattern, where, &filtered_rows);
+
+    if (unique || unique_by != NULL) {
+        Row** unique_rows = NULL;
+        filtered_count = apply_unique(arena, filtered_rows, filtered_count, header, unique, unique_by,
+                                      &unique_rows);
+        filtered_rows = unique_rows;
+    }
+
+    size_t max_groups = (group_column_count > 0 && filtered_count > 0) ? filtered_count : 1;
+    AggregateGroup* groups = ARENA_ALLOC_ARRAY(arena, AggregateGroup, max_groups);
+    if (groups == NULL) {
+        fprintf(stderr, "Error: Failed to allocate aggregation groups\n");
+        arena_destroy(arena);
+        return false;
+    }
+
+    HashMap* group_map = NULL;
+    if (group_column_count > 0) {
+        group_map = map_create(MapConfigStr);
+        if (group_map == NULL) {
+            fprintf(stderr, "Error: Failed to allocate group-by map\n");
+            arena_destroy(arena);
+            return false;
+        }
+    }
+
+    size_t group_total = 0;
+    for (size_t r = 0; r < filtered_count; r++) {
+        Row* row = filtered_rows[r];
+        AggregateGroup* group = NULL;
+
+        if (group_column_count == 0) {
+            if (group_total == 0) {
+                group = &groups[group_total++];
+            } else {
+                group = &groups[0];
+            }
+        } else {
+            char* key = build_unique_key(arena, row, group_columns, group_column_count);
+            if (key == NULL) {
+                continue;
+            }
+
+            size_t key_len = strlen(key) + 1;
+            group = map_get(group_map, key, key_len);
+            if (group == NULL) {
+                group = &groups[group_total++];
+                group->key_values = ARENA_ALLOC_ARRAY(arena, const char*, group_column_count);
+                if (group->key_values == NULL) {
+                    continue;
+                }
+                for (size_t c = 0; c < group_column_count; c++) {
+                    size_t col = group_columns[c];
+                    const char* field =
+                        (col < row->count && row->fields[col] != NULL) ? row->fields[col] : "";
+                    group->key_values[c] = arena_trimmed_strdup(arena, field);
+                }
+                map_set(group_map, key, key_len, group);
+            }
+        }
+
+        if (group == NULL) {
+            continue;
+        }
+
+        if (group->states == NULL) {
+            group->states = ARENA_ALLOC_ARRAY(arena, AggregateState, aggregates.count);
+            if (group->states == NULL) {
+                continue;
+            }
+        }
+
+        group->row_count++;
+        for (size_t a = 0; a < aggregates.count; a++) {
+            update_aggregate_state(&group->states[a], row, &aggregates.specs[a]);
+        }
+    }
+
+    if (group_column_count == 0 && group_total == 0) {
+        group_total = 1;
+        groups[0].states = ARENA_ALLOC_ARRAY(arena, AggregateState, aggregates.count);
+    }
+
+    size_t output_columns = group_column_count + aggregates.count;
+    Row** output_rows = ARENA_ALLOC_ARRAY(arena, Row*, group_total + 1);
+    if (output_rows == NULL) {
+        map_destroy(group_map);
+        arena_destroy(arena);
+        return false;
+    }
+
+    const char** header_fields = ARENA_ALLOC_ARRAY(arena, const char*, output_columns);
+    if (header_fields == NULL) {
+        map_destroy(group_map);
+        arena_destroy(arena);
+        return false;
+    }
+
+    for (size_t c = 0; c < group_column_count; c++) {
+        size_t col = group_columns[c];
+        if (header != NULL && col < header->count && header->fields[col] != NULL) {
+            header_fields[c] = arena_trimmed_strdup(arena, header->fields[col]);
+        } else {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "col_%zu", col);
+            header_fields[c] = arena_strdup(arena, buf);
+        }
+    }
+
+    for (size_t a = 0; a < aggregates.count; a++) {
+        header_fields[group_column_count + a] = aggregates.specs[a].label;
+    }
+
+    output_rows[0] = make_synthetic_row(arena, header_fields, output_columns);
+
+    for (size_t g = 0; g < group_total; g++) {
+        AggregateGroup* group = &groups[g];
+        const char** fields = ARENA_ALLOC_ARRAY(arena, const char*, output_columns);
+        if (fields == NULL) {
+            continue;
+        }
+
+        for (size_t c = 0; c < group_column_count; c++) {
+            fields[c] = (group->key_values != NULL && group->key_values[c] != NULL)
+                            ? group->key_values[c]
+                            : "";
+        }
+
+        for (size_t a = 0; a < aggregates.count; a++) {
+            fields[group_column_count + a] =
+                format_aggregate_value(arena, &aggregates.specs[a], &group->states[a],
+                                       group->row_count);
+        }
+
+        output_rows[g + 1] = make_synthetic_row(arena, fields, output_columns);
+    }
+
+    map_destroy(group_map);
+
+    PrintConfig config = {.has_header = true,
+                          .format = format,
+                          .use_colors = use_colors,
+                          .use_bgcolor = false,
+                          .filter_pattern = NULL,
+                          .where = NULL,
+                          .selection = NULL,
+                          .unique = false,
+                          .unique_by = NULL,
+                          .limit = limit,
+                          .offset = offset};
+
+    print_table(output_rows, group_total + 1, &config);
+
+    arena_destroy(arena);
+    return true;
+}
+
 // =============================================================================
 // FORMAT-SPECIFIC OUTPUT
 // =============================================================================
@@ -1370,8 +2195,13 @@ static void print_row_format(const Row* row, size_t col_count, OutputFormat form
 
                 char* field = "";
                 if (col < row->count && row->fields[col] != NULL) {
-                    field = row->fields[col];
-                    str_trim(field);
+                    // Trim a scratch copy so synthetic rows and shared header
+                    // values are never modified.
+                    char* copy = arena_strdup(scratch, row->fields[col]);
+                    if (copy != NULL) {
+                        str_trim(copy);
+                        field = copy;
+                    }
                 }
 
                 // Check if number
@@ -1635,6 +2465,15 @@ static void print_table(Row** rows, size_t row_count, const PrintConfig* config)
     size_t filtered_count = filter_rows(print_arena, rows, row_count, config->has_header,
                                         config->filter_pattern, config->where, &filtered_rows);
 
+    // Remove duplicate rows after filtering, preserving sort order.
+    if (config->unique || config->unique_by != NULL) {
+        Row** unique_rows = NULL;
+        const Row* unique_header = config->has_header ? rows[0] : NULL;
+        filtered_count = apply_unique(print_arena, filtered_rows, filtered_count, unique_header,
+                                      config->unique, config->unique_by, &unique_rows);
+        filtered_rows = unique_rows;
+    }
+
     size_t window_start = 0;
     size_t window_count = 0;
     compute_row_window(filtered_count, config->offset, config->limit, &window_start, &window_count);
@@ -1692,6 +2531,70 @@ static void print_table(Row** rows, size_t row_count, const PrintConfig* config)
 // =============================================================================
 // COMMAND-LINE PARSING
 // =============================================================================
+
+/**
+ * Copies standard input to a temporary file so the CSV reader can seek over
+ * it (the solidc parser counts rows before parsing and therefore needs a
+ * seekable stream).
+ *
+ * @return malloc'd path to the temporary file, or NULL on failure.
+ *         The caller must remove() and free() it.
+ */
+static char* read_stdin_to_tempfile(void) {
+#ifdef _WIN32
+    char* path = _tempnam(NULL, "csvq");
+    if (path == NULL) {
+        return NULL;
+    }
+    FILE* file = fopen(path, "wb");
+    if (file == NULL) {
+        free(path);
+        return NULL;
+    }
+#else
+    char template[] = "/tmp/csvq-stdin-XXXXXX";
+    int fd = mkstemp(template);
+    if (fd < 0) {
+        return NULL;
+    }
+
+    FILE* file = fdopen(fd, "wb");
+    if (file == NULL) {
+        close(fd);
+        remove(template);
+        return NULL;
+    }
+
+    char* path = strdup(template);
+    if (path == NULL) {
+        fclose(file);
+        remove(template);
+        return NULL;
+    }
+#endif
+
+    char buffer[8192];
+    size_t read_count = 0;
+    while ((read_count = fread(buffer, 1, sizeof(buffer), stdin)) > 0) {
+        if (fwrite(buffer, 1, read_count, file) != read_count) {
+            fclose(file);
+            remove(path);
+            free(path);
+            return NULL;
+        }
+    }
+
+    bool read_error = ferror(stdin) != 0;
+    fclose(file);
+
+    if (read_error) {
+        remove(path);
+        free(path);
+        return NULL;
+    }
+
+    return path;
+}
 
 /**
  * Parses delimiter string (handles special case of "\t" for tab).
@@ -1769,6 +2672,12 @@ int main(int argc, char* argv[]) {
     char* sort_col = NULL;
     bool count_only = false;
     bool describe_only = false;
+    bool unique = false;
+    char* unique_by = NULL;
+    char* group_by_str = NULL;
+    char* aggregate_str = NULL;
+    bool show_version = false;
+    bool use_stdin = false;
     char* limit_str = NULL;
     char* offset_str = NULL;
     size_t limit = SIZE_MAX;
@@ -1783,6 +2692,10 @@ int main(int argc, char* argv[]) {
     flag_bool(parser, "count", 'n', "Print number of rows after filtering", &count_only);
     flag_bool(parser, "describe", 'a',
               "Print numeric stats (count/min/max/mean) for visible columns", &describe_only);
+    flag_bool(parser, "unique", 'u', "Remove duplicate rows (all columns)", &unique);
+    flag_bool(parser, "version", 'V', "Print version information and exit", &show_version);
+    flag_bool(parser, "stdin", 0, "Read CSV data from standard input (or use '-' as filename)",
+              &use_stdin);
     flag_char(parser, "comment", 'c', "Comment Character", &comment);
     flag_string(parser, "delimiter", 'd', "The CSV delimiter (use '\\t' for tab)", &delim_arg);
     flag_string(parser, "hide", 'H', "Comma-separated column indices to hide (e.g., 0,2,5)",
@@ -1794,20 +2707,52 @@ int main(int argc, char* argv[]) {
                 &where_str);
     flag_string(parser, "select", 'S', "Select and order columns (e.g., 'name,age' or '0,2,1')",
                 &select_str);
-    flag_string(parser, "output", 'o', "Output format: table (default), csv, tsv, json, markdown",
+    flag_string(parser, "output", 'o',
+                "Output format: table (default), csv, tsv, json, markdown, html, excel",
                 &format_str);
-    flag_string(parser, "sort", 'B', "Sort by column name or index", &sort_col);
+    flag_string(parser, "sort", 'B',
+                "Sort by column(s); comma-separate keys, prefix '-' for descending (e.g., "
+                "'city,-age')",
+                &sort_col);
+    flag_string(parser, "unique-by", 'U', "Remove duplicates using these columns (e.g., 'id')",
+                &unique_by);
+    flag_string(parser, "group-by", 'g',
+                "Group rows by columns before aggregating (e.g., 'region')", &group_by_str);
+    flag_string(parser, "aggregate", 'A',
+                "Aggregate expressions: count, count(*), sum(col), avg(col), min(col), max(col)",
+                &aggregate_str);
     flag_string(parser, "limit", 'l', "Limit output rows after filtering/sorting", &limit_str);
     flag_string(parser, "offset", 'O', "Skip N rows after filtering/sorting", &offset_str);
 
+    // Accept a bare "-" as an alias for --stdin. The flag parser treats
+    // dash-prefixed arguments as flags, so rewrite it before parsing.
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], STDIN_FILENAME) == 0) {
+            argv[i] = (char*)"--stdin";
+        }
+    }
+
     // Parse flags
     if (flag_parse(parser, argc, argv) != FLAG_OK) {
+        const char* parse_error = flag_get_error(parser);
+        if (parse_error != NULL && parse_error[0] != '\0') {
+            fprintf(stderr, "Error: %s\n", parse_error);
+        } else {
+            fprintf(stderr, "Error: Failed to parse command-line arguments\n");
+        }
         flag_parser_free(parser);
         arena_destroy(arena);
         return EXIT_FAILURE;
     }
 
-    if (flag_positional_count(parser) < 1) {
+    if (show_version) {
+        printf("csvq %s\n", CSVQ_VERSION);
+        flag_parser_free(parser);
+        arena_destroy(arena);
+        return EXIT_SUCCESS;
+    }
+
+    if (flag_positional_count(parser) < 1 && !use_stdin) {
         fprintf(stderr, "Required positional argument <filename> is missing\n");
         flag_print_usage(parser);
         flag_parser_free(parser);
@@ -1815,7 +2760,20 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    const char* filename = flag_positional_at(parser, 0);
+    const char* filename =
+        flag_positional_count(parser) > 0 ? flag_positional_at(parser, 0) : NULL;
+    const char* input_filename = filename;
+    char* stdin_temp_path = NULL;
+    if (use_stdin || (filename != NULL && strcmp(filename, STDIN_FILENAME) == 0)) {
+        stdin_temp_path = read_stdin_to_tempfile();
+        if (stdin_temp_path == NULL) {
+            fprintf(stderr, "Error: Failed to read CSV data from standard input\n");
+            flag_parser_free(parser);
+            arena_destroy(arena);
+            return EXIT_FAILURE;
+        }
+        input_filename = stdin_temp_path;
+    }
 
     // Parse configuration
     char delimiter = parse_delimiter(delim_arg);
@@ -1846,8 +2804,12 @@ int main(int argc, char* argv[]) {
     }
 
     // Initialize CSV reader
-    CsvReader* reader = csv_reader_new(filename, 0);
+    CsvReader* reader = csv_reader_new(input_filename, 0);
     if (reader == NULL) {
+        if (stdin_temp_path != NULL) {
+            remove(stdin_temp_path);
+            free(stdin_temp_path);
+        }
         flag_parser_free(parser);
         arena_destroy(arena);
         return EXIT_FAILURE;
@@ -1864,6 +2826,11 @@ int main(int argc, char* argv[]) {
     csv_reader_setconfig(reader, config);
 
     Row** rows = csv_reader_parse(reader);
+    if (stdin_temp_path != NULL) {
+        remove(stdin_temp_path);
+        free(stdin_temp_path);
+        stdin_temp_path = NULL;
+    }
     if (rows == NULL) {
         fprintf(stderr, "Error: Failed to parse CSV file, likely due to invalid delimiter. ");
         fprintf(stderr, "Use --delimiter='\\\\t' for Tab-separated Value file\n");
@@ -1884,7 +2851,7 @@ int main(int argc, char* argv[]) {
 
     // Sort if requested
     if (sort_col != NULL) {
-        sort_rows(rows, count, has_header, sort_col, sort_desc);
+        sort_rows(arena, rows, count, has_header, sort_col, sort_desc);
     }
 
     // Parse column selection
@@ -1910,8 +2877,29 @@ int main(int argc, char* argv[]) {
         resolve_ast_indices(where_ptr->root, rows[0]);
     }
 
+    // Aggregation/grouping takes precedence over --count and --describe.
+    if (aggregate_str != NULL || group_by_str != NULL) {
+        bool ok = print_aggregate_stats(rows, count, has_header, filter_pattern, where_ptr, unique,
+                                        unique_by, group_by_str, aggregate_str, format, use_colors,
+                                        limit, offset);
+        csv_reader_free(reader);
+        flag_parser_free(parser);
+        arena_destroy(arena);
+        return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
     if (count_only) {
-        size_t matched = count_filtered_rows(rows, count, has_header, filter_pattern, where_ptr);
+        Row** filtered_rows = NULL;
+        size_t matched =
+            filter_rows(arena, rows, count, has_header, filter_pattern, where_ptr, &filtered_rows);
+
+        if (unique || unique_by != NULL) {
+            Row** unique_rows = NULL;
+            const Row* header = has_header ? rows[0] : NULL;
+            matched = apply_unique(arena, filtered_rows, matched, header, unique, unique_by,
+                                   &unique_rows);
+        }
+
         printf("%zu\n", matched);
         csv_reader_free(reader);
         flag_parser_free(parser);
@@ -1920,8 +2908,8 @@ int main(int argc, char* argv[]) {
     }
 
     if (describe_only) {
-        print_describe_stats(rows, count, has_header, filter_pattern, where_ptr, sel_ptr,
-                             use_colors);
+        print_describe_stats(rows, count, has_header, filter_pattern, where_ptr, sel_ptr, unique,
+                             unique_by, use_colors);
         csv_reader_free(reader);
         flag_parser_free(parser);
         arena_destroy(arena);
@@ -1936,6 +2924,8 @@ int main(int argc, char* argv[]) {
                                 .filter_pattern = filter_pattern,
                                 .where = where_ptr,
                                 .selection = sel_ptr,
+                                .unique = unique,
+                                .unique_by = unique_by,
                                 .limit = limit,
                                 .offset = offset};
 

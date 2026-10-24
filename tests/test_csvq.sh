@@ -63,6 +63,14 @@ run() {
     err=$(cat "$tmpdir/stderr")
 }
 
+run_stdin() {
+    input=$1
+    shift
+    out=$(printf '%s\n' "$input" | "$CSVQ" "$@" 2>"$tmpdir/stderr")
+    status=$?
+    err=$(cat "$tmpdir/stderr")
+}
+
 fail() {
     failed=$((failed + 1))
     printf 'not ok %d - %s\n' "$total" "$1"
@@ -211,6 +219,35 @@ ragged=$tmpdir/ragged.csv
 cat >"$ragged" <<'EOF'
 a,b,c
 1,2
+EOF
+
+sales=$tmpdir/sales.csv
+cat >"$sales" <<'EOF'
+region,product,amount,qty
+East,Widget,10,2
+West,Widget,20,3
+East,Gadget,30,4
+West,Gadget,40,5
+EOF
+
+duplicates=$tmpdir/duplicates.csv
+cat >"$duplicates" <<'EOF'
+id,name,dept
+1,Alice,eng
+1,Alicia,eng
+2,Bob,sales
+3,Carol,eng
+3,Carol,eng
+EOF
+
+mixed=$tmpdir/mixed.csv
+cat >"$mixed" <<'EOF'
+group,value
+a,1
+a,
+a,nope
+b,4
+c,text
 EOF
 
 # ---------------------------------------------------------------------------
@@ -584,6 +621,12 @@ check_contains "--describe honours the selected columns" "$out" 'age'
 check_contains "--describe honours the selected columns (2)" "$out" 'score'
 check_not_contains "--describe hides unselected columns" "$out" 'name'
 
+run "$people" -n -l 2
+check_eq "--count ignores pagination" '5' "$out"
+
+run "$people" -a -l 1
+check_contains "--describe ignores pagination" "$err" 'Describe summary computed on 5 filtered rows'
+
 # ---------------------------------------------------------------------------
 # Output formats
 # ---------------------------------------------------------------------------
@@ -750,6 +793,290 @@ check_eq "markdown reports how many rows matched" '| id | name | age | city | sc
 | 5 | Eve | 40 | Berlin |  |
 
 Filtered: 2/5 rows matched' "$out"
+
+# ---------------------------------------------------------------------------
+# Version
+# ---------------------------------------------------------------------------
+
+run --version
+check_status "--version exits successfully" 0 "$status"
+check_eq "--version reports the program version" 'csvq 0.2.0' "$out"
+
+run -V
+check_status "-V exits successfully" 0 "$status"
+check_eq "-V is the short form of --version" 'csvq 0.2.0' "$out"
+
+run --help
+check_status "--help exits successfully" 0 "$status"
+check_contains "--help prints usage information" "$out" 'Usage:'
+
+run --bogus
+check_status "unknown flags fail" 1 "$status"
+check_contains "unknown flags are reported" "$err" 'Unknown flag: --bogus'
+
+# ---------------------------------------------------------------------------
+# Standard input
+# ---------------------------------------------------------------------------
+
+run_stdin 'a,b
+1,2' - -o csv
+check_status "stdin via '-' exits successfully" 0 "$status"
+check_eq "stdin via '-' is parsed as CSV" 'a,b
+1,2' "$out"
+
+run_stdin 'a,b
+1,2' --stdin -o csv
+check_status "--stdin without a filename exits successfully" 0 "$status"
+check_eq "--stdin is equivalent to '-'" 'a,b
+1,2' "$out"
+
+run_stdin 'a,b
+1,2
+3,4' - -n
+check_eq "--count works on stdin" '2' "$out"
+
+run_stdin 'a,b
+1,x
+1,x
+2,y' - --unique -o csv
+check_eq "--unique works on stdin" 'a,b
+1,x
+2,y' "$out"
+
+run_stdin 'a,b
+1,2
+3,4' - -A 'sum(b)' -o csv
+check_eq "aggregation works on stdin" 'sum(b)
+6' "$out"
+
+run_stdin 'g,v
+a,1
+a,2
+b,3' --stdin -g g -A 'count,sum(v)' -o csv
+check_eq "grouping works on stdin" 'g,count,sum(v)
+a,2,3
+b,1,3' "$out"
+
+run_stdin '1,2
+3,4' - -s -o csv
+check_eq "--skip-header works on stdin" '1,2
+3,4' "$out"
+
+# ---------------------------------------------------------------------------
+# Duplicate removal
+# ---------------------------------------------------------------------------
+
+run "$duplicates" --unique -o csv
+check_status "--unique exits successfully" 0 "$status"
+check_eq "--unique removes exact duplicate rows" 'id,name,dept
+1,Alice,eng
+1,Alicia,eng
+2,Bob,sales
+3,Carol,eng' "$out"
+
+run "$duplicates" -u -o csv
+check_eq "-u is the short form of --unique" 'id,name,dept
+1,Alice,eng
+1,Alicia,eng
+2,Bob,sales
+3,Carol,eng' "$out"
+
+run "$duplicates" --unique-by id -o csv
+check_status "--unique-by exits successfully" 0 "$status"
+check_eq "--unique-by keeps the first row per key" 'id,name,dept
+1,Alice,eng
+2,Bob,sales
+3,Carol,eng' "$out"
+
+run "$duplicates" -U dept -o csv
+check_eq "-U deduplicates using the selected columns" 'id,name,dept
+1,Alice,eng
+2,Bob,sales' "$out"
+
+run "$duplicates" -u -n
+check_eq "--count reflects deduplicated rows" '4' "$out"
+
+run "$duplicates" -u -a
+check_status "--describe with --unique exits successfully" 0 "$status"
+check_contains "--describe counts deduplicated rows" "$err" 'Describe summary computed on 4 filtered rows'
+
+run "$duplicates" -u -w 'dept = eng' -o csv
+check_eq "WHERE filtering runs before deduplication" 'id,name,dept
+1,Alice,eng
+1,Alicia,eng
+3,Carol,eng' "$out"
+
+run "$duplicates" -U nope -o csv
+check_status "--unique-by with an unknown column still succeeds" 0 "$status"
+check_contains "--unique-by warns about the unknown column" "$err" "Column 'nope' not found"
+check_contains "--unique-by warns that deduplication was skipped" "$err" \
+    '--unique-by did not resolve any columns'
+check_contains "--unique-by with an unknown column leaves duplicates intact" "$out" \
+    '3,Carol,eng
+3,Carol,eng'
+
+# ---------------------------------------------------------------------------
+# Multi-column sorting
+# ---------------------------------------------------------------------------
+
+run "$sales" -B 'region,-amount' -o csv
+check_status "multi-column --sort exits successfully" 0 "$status"
+check_eq "multi-column --sort honours per-key direction" 'region,product,amount,qty
+East,Gadget,30,4
+East,Widget,10,2
+West,Gadget,40,5
+West,Widget,20,3' "$out"
+
+run "$sales" --sort '+region,+amount' -o csv
+check_eq "multi-column --sort accepts explicit ascending prefixes" 'region,product,amount,qty
+East,Widget,10,2
+East,Gadget,30,4
+West,Widget,20,3
+West,Gadget,40,5' "$out"
+
+run "$sales" -B 'region,amount' -D -o csv
+check_eq "-D applies to keys without an explicit prefix" 'region,product,amount,qty
+West,Gadget,40,5
+West,Widget,20,3
+East,Gadget,30,4
+East,Widget,10,2' "$out"
+
+run "$people" --sort=-city,age -o csv
+check_eq "a leading descending key can be attached with '='" 'id,name,age,city,score
+3,Carol,35,Paris,72.25
+4,dave,28,new york,100
+1,Alice,30,New York,95.5
+2,Bob,25,London,88
+5,Eve,40,Berlin,' "$out"
+
+run "$sales" -B 'nope,region' -o csv
+check_status "multi-column --sort with one bad key still succeeds" 0 "$status"
+check_contains "multi-column --sort warns about the bad key" "$err" \
+    "Could not resolve sort column 'nope'"
+check_eq "multi-column --sort still applies the valid keys" 'region,product,amount,qty
+East,Widget,10,2
+East,Gadget,30,4
+West,Widget,20,3
+West,Gadget,40,5' "$out"
+
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
+
+run "$sales" -A 'count,count(*),sum(amount),avg(amount),min(amount),max(amount)' -o csv
+check_status "--aggregate exits successfully" 0 "$status"
+check_eq "--aggregate supports every function" 'count,count(*),sum(amount),avg(amount),min(amount),max(amount)
+4,4,100,25,10,40' "$out"
+
+run "$sales" --aggregate 'sum(amount)' --output csv
+check_eq "--aggregate accepts column names" 'sum(amount)
+100' "$out"
+
+run "$sales" -A 'sum(2)' -o csv
+check_eq "--aggregate accepts numeric column indices" 'sum(2)
+100' "$out"
+
+run "$sales" -A 'count,sum(amount)' -w 'region = East' -o csv
+check_eq "--aggregate respects WHERE filters" 'count,sum(amount)
+2,40' "$out"
+
+run "$sales" -n -A count -o csv
+check_eq "aggregation takes precedence over --count" 'count
+4' "$out"
+
+run "$sales" -A count -S region -o csv
+check_eq "aggregation ignores --select" 'count
+4' "$out"
+
+run "$sales" -A count -o json
+check_eq "--aggregate renders in JSON" '[
+  {"count": "4"}
+]' "$out"
+
+# ---------------------------------------------------------------------------
+# Grouping
+# ---------------------------------------------------------------------------
+
+run "$sales" -g region -A 'count,sum(amount),avg(qty),min(qty),max(qty)' -o csv
+check_status "--group-by exits successfully" 0 "$status"
+check_eq "--group-by aggregates each group" 'region,count,sum(amount),avg(qty),min(qty),max(qty)
+East,2,40,3,2,4
+West,2,60,4,3,5' "$out"
+
+run "$sales" --group-by region -o csv
+check_eq "--group-by without an aggregate defaults to count" 'region,count
+East,2
+West,2' "$out"
+
+run "$sales" -g 'region,product' -A 'sum(amount)' -o csv
+check_eq "--group-by supports multiple columns" 'region,product,sum(amount)
+East,Widget,10
+West,Widget,20
+East,Gadget,30
+West,Gadget,40' "$out"
+
+run "$sales" -g region -A 'count,sum(amount)' -w 'amount >= 20' -o csv
+check_eq "--group-by respects WHERE filters" 'region,count,sum(amount)
+West,2,60
+East,1,30' "$out"
+
+run "$duplicates" -g dept -U id -A count -o csv
+check_eq "deduplication runs before grouping" 'dept,count
+eng,2
+sales,1' "$out"
+
+run "$sales" -g region -A count -l 1 -o csv
+check_eq "--limit applies to aggregate result rows" 'region,count
+East,2' "$out"
+
+run "$mixed" -g group -A 'count,sum(value),avg(value),min(value),max(value)' -o csv
+check_eq "missing and non-numeric values are ignored by aggregates" 'group,count,sum(value),avg(value),min(value),max(value)
+a,3,1,1,1,1
+b,1,4,4,4,4
+c,1,-,-,-,-' "$out"
+
+run "$mixed" -A 'count,sum(value),avg(value),min(value),max(value)' -o csv
+check_eq "aggregates over a whole file ignore missing values" 'count,sum(value),avg(value),min(value),max(value)
+5,5,2.5,1,4' "$out"
+
+run "$sales" -g region -A 'count,sum(amount)' -o json
+check_eq "grouped aggregates render in JSON" '[
+  {"region": "East", "count": "2", "sum(amount)": "40"},
+  {"region": "West", "count": "2", "sum(amount)": "60"}
+]' "$out"
+
+run "$sales" -g region -A 'count,sum(amount)' -o markdown
+check_eq "grouped aggregates render in Markdown" '| region | count | sum(amount) |
+| --- | --- | --- |
+| East | 2 | 40 |
+| West | 2 | 60 |' "$out"
+
+# ---------------------------------------------------------------------------
+# Aggregation errors
+# ---------------------------------------------------------------------------
+
+run "$sales" -A 'median(amount)' -o csv
+check_status "unknown aggregate functions fail" 1 "$status"
+check_contains "unknown aggregate functions are reported" "$err" \
+    "Invalid aggregate expression 'median(amount)'"
+
+run "$sales" -A 'sum(nope)' -o csv
+check_status "unknown aggregate columns fail" 1 "$status"
+check_contains "unknown aggregate columns are reported" "$err" "Unknown aggregate column 'nope'"
+
+run "$sales" -g nope -o csv
+check_status "unknown group-by columns fail" 1 "$status"
+check_contains "unknown group-by columns are reported" "$err" "Unknown group-by column 'nope'"
+
+run "$sales" --aggregate= -o csv
+check_status "an empty aggregate expression fails" 1 "$status"
+check_contains "an empty aggregate expression is reported" "$err" \
+    '--aggregate needs at least one expression'
+
+run "$sales" --group-by= -o csv
+check_status "an empty group-by column list fails" 1 "$status"
+check_contains "an empty group-by column list is reported" "$err" \
+    '--group-by needs at least one column'
 
 # ---------------------------------------------------------------------------
 # Error handling
